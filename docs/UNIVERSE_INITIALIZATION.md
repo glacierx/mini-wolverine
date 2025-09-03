@@ -1,8 +1,18 @@
-# ATUniverseRes and ATUniverseSeeds Initialization Documentation
+# Universe Initialization in Mini Wolverine
+
+**Backend WASM Architecture - ATUniverseRes and ATUniverseSeeds**
 
 ## Overview
 
-This document provides comprehensive documentation on the initialization process of `ATUniverseRes` and `ATUniverseSeeds` within the Caitlyn WASM financial data processing system. These components are critical for loading and managing market metadata and seed data that form the foundation of the financial data infrastructure.
+This document provides comprehensive documentation on the universe initialization process within **Mini Wolverine's backend-frontend architecture**. All WASM operations happen in the Node.js backend, with the React frontend receiving processed results via WebSocket.
+
+**Key Architecture Points:**
+- **Backend-Only WASM**: All ATUniverseRes and ATUniverseSeeds operations handled by WasmService
+- **WebSocket Proxy**: Backend acts as intelligent proxy between frontend and Caitlyn servers
+- **Memory Management**: Production-grade WASM object lifecycle handling
+- **AI-Friendly**: Clean separation allows AI coding agents to easily extend functionality
+
+**Implemented Status:** ✅ Production-ready in Mini Wolverine backend
 
 ## Table of Contents
 
@@ -22,62 +32,69 @@ The ATUniverse initialization system consists of two main components:
 ### Component Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Caitlyn WASM System                         │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────┐    ┌─────────────────┐                    │
-│  │  ATUniverseRes  │    │ATUniverseSeeds  │                    │
-│  │                 │    │                 │                    │
-│  │ - Universe      │    │ - Market Seeds  │                    │
-│  │   Revision      │    │ - Commodity     │                    │
-│  │ - Metadata      │    │   Data          │                    │
-│  │ - Schema Info   │    │ - Futures Data  │                    │
-│  └─────────────────┘    │ - Security Data │                    │
-│            │             └─────────────────┘                    │
-│            │                       │                           │
-│  ┌─────────────────────────────────────────────────────────────┤
-│  │               Binary WebSocket Layer                        │
-│  └─────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────────────┤
-│  │                   Server Communication                      │
-│  └─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                   Mini Wolverine Architecture                    │
+├──────────────────────────────────────────────────────────────────┤
+│ React Frontend (Pure UI)     │    Node.js Backend (WASM)         │
+│ ┌─────────────────────────┐  │  ┌─────────────────────────┐      │
+│ │  BackendWebSocketContext│◄────┤      WasmService        │      │
+│ │  DataContext            │  │  │  ┌─────────────────┐    │      │
+│ │  Components (UI only)   │  │  │  │  ATUniverseRes  │    │      │
+│ └─────────────────────────┘  │  │  │ - Universe Rev  │    │      │
+│                              │  │  │ - Market Meta   │    │      │
+│                              │  │  └─────────────────┘    │      │
+│                              │  │  ┌─────────────────┐    │      │
+│                              │  │  │ATUniverseSeeds  │    │      │
+│                              │  │  │ - Market Seeds  │    │      │
+│                              │  │  │ - Instruments   │    │      │
+│                              │  │  └─────────────────┘    │      │
+│                              │  └─────────────────────────┘      │
+├──────────────────────────────┼───────────────────────────────────┤
+│        WebSocket API         │     caitlyn_js.wasm Processing    │
+├──────────────────────────────┼───────────────────────────────────┤
+│                          External Caitlyn Server                 │
+│                      wss://116.wolverine-box.com/tm              │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Initialization Flow
 
 ```mermaid
 sequenceDiagram
-    participant App as Application
-    participant WS as WebSocket Service  
-    participant WASM as Caitlyn WASM
-    participant Server as Data Server
+    participant Frontend as React Frontend
+    participant Backend as Node.js Backend
+    participant WasmService as WasmService
+    participant CaitlynServer as Caitlyn Server
 
-    Note over App,Server: Phase 1: Schema Initialization (Server Push)
-    Server->>WASM: Schema Definition (NET_CMD_GOLD_ROUTE_DATADEF)
-    WASM->>WASM: Process IndexMeta & Initialize Compressor
-    WASM-->>App: Schema ready
+    Note over Frontend,CaitlynServer: Phase 1: Connection & Schema (Automatic)
+    Frontend->>Backend: WebSocket Connection
+    Backend->>CaitlynServer: Handshake + Connection
+    CaitlynServer->>Backend: Schema Definition (NET_CMD_GOLD_ROUTE_DATADEF)
+    Backend->>WasmService: processSchema(content)
+    WasmService->>WasmService: IndexSchema + IndexSerializer setup
+    Backend->>Frontend: schema_received event (JSON)
 
-    Note over App,Server: Phase 2: Universe Revision Request
-    App->>WS: Request Universe Revision
-    WS->>Server: CMD_AT_UNIVERSE_REV
-    Server-->>WASM: Universe revision data
-    WASM->>WASM: Create ATUniverseRes
-    WASM->>WASM: Set compressor & decode
-    WASM-->>App: Universe metadata ready
+    Note over Frontend,CaitlynServer: Phase 2: Universe Revision Request
+    Frontend->>Backend: {type: 'test_universe_revision'}
+    Backend->>WasmService: createUniverseRequest(token)
+    WasmService->>CaitlynServer: CMD_AT_UNIVERSE_REV (binary)
+    CaitlynServer->>Backend: Universe revision data (binary)
+    Backend->>WasmService: processUniverseRevision(content)
+    WasmService->>WasmService: ATUniverseRes + market extraction
+    Backend->>Frontend: universe_revision event (processed markets)
 
-    Note over App,Server: Phase 3: Market Seeds Loading (Triggered by ATUniverseRes)
-    App->>App: Process markets from ATUniverseRes
-    loop For each market in ATUniverseRes
-        App->>WS: Request Universe Seeds for market
-        WS->>Server: CMD_AT_UNIVERSE_SEEDS  
-        Server-->>WASM: Market seed data for specific market
-        WASM->>WASM: Create ATUniverseSeedsRes
-        WASM->>WASM: Set compressor & decode
-        WASM-->>App: Market seeds ready for this market
+    Note over Frontend,CaitlynServer: Phase 3: Universe Seeds (Auto-triggered)
+    Backend->>Backend: Generate seeds requests for all markets
+    loop For each market/qualified_name
+        Backend->>WasmService: createUniverseSeedsRequest(...)
+        WasmService->>CaitlynServer: CMD_AT_UNIVERSE_SEEDS (binary)
+        CaitlynServer->>Backend: Market seed data (binary)
+        Backend->>WasmService: processUniverseSeeds(content)
+        WasmService->>WasmService: ATUniverseSeedsRes processing
     end
+    Backend->>Frontend: universe_seeds events (processed data)
 
-    Note over App,Server: Initialization Complete
-    App->>App: Process & Store Market Data
+    Note over Frontend,CaitlynServer: Initialization Complete - Ready for Trading/Data Requests
 ```
 
 ## ATUniverseRes Initialization

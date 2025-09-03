@@ -1,10 +1,26 @@
 # Standalone Frontend Demo Development Guide
 
+**⚠️ DEPRECATED - Use Mini Wolverine Backend-Frontend Architecture Instead**
+
 ## Overview
 
-This comprehensive guide enables developers to create a standalone frontend demo application using only the `caitlyn_js.js` and `caitlyn_js.wasm` files. This guide is fully aligned with the reference implementation in `docs/test.js` and incorporates all critical discoveries from reverse engineering the Caitlyn WASM protocol.
+**This guide is now deprecated** in favor of Mini Wolverine's **backend-frontend architecture**. While this guide still works for standalone development, the recommended approach is to use Mini Wolverine's production-ready backend that handles all WASM operations.
 
-**🚀 Reference Implementation**: This guide is based on the definitive universe initialization patterns found in `docs/test.js`. Always refer to that file for the most current and tested implementation.
+**🎯 Recommended Approach**: Use Mini Wolverine's Node.js backend + React frontend architecture for:
+- Production-ready WASM memory management
+- AI-friendly development environment  
+- Comprehensive testing and error handling
+- Upcoming trading and automation features
+
+**📖 For Current Implementation**: See `backend/src/services/WasmService.js` and `examples/test.js` for production patterns.
+
+### Migration Path
+
+**From Standalone → Mini Wolverine:**
+1. **Backend Setup**: `docker-compose up -d` - starts Node.js backend with WASM
+2. **Frontend Integration**: React frontend connects to backend WebSocket API
+3. **No WASM in Frontend**: All WASM operations handled by backend
+4. **Enhanced Features**: Access to trading, automation, and AI development tools
 
 ## Table of Contents
 

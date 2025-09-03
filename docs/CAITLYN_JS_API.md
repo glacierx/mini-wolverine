@@ -1,6 +1,27 @@
 # Caitlyn JavaScript API Reference
 
-This document describes the official Caitlyn JavaScript interface as defined in `docs/cxx/caitlyn_js.cpp`.
+**Mini Wolverine Backend WASM Integration Guide**
+
+This document describes the official Caitlyn JavaScript interface as implemented in Mini Wolverine's backend architecture. All WASM operations are handled server-side by the Node.js backend, with the React frontend communicating via WebSocket.
+
+## Architecture Overview
+
+```
+React Frontend                 Node.js Backend                External Server
+     │                              │                            │
+     │ ── WebSocket Message ──→ WasmService ── Binary Protocol ──→ Caitlyn Server
+     │                           │                               │
+     │                      WASM Processing                      │
+     │                      (caitlyn_js.wasm)                   │
+     │                              │                            │
+     │ ←── JSON Response ─────── Response Handler ←── Binary ─── │
+```
+
+**Key Points:**
+- **Backend-Only WASM**: All caitlyn_js.wasm operations happen in Node.js backend
+- **WebSocket Proxy**: Backend acts as intelligent proxy between frontend and Caitlyn servers  
+- **Memory Management**: Production-grade WASM object lifecycle handling
+- **AI-Friendly**: Clean separation allows AI coding agents to easily extend functionality
 
 ## Command Constants
 
@@ -28,14 +49,14 @@ wasmModule.CMD_AT_SUBSCRIBE                  // Subscribe to data feeds
 wasmModule.CMD_AT_SUBSCRIBE_SORT             // Subscribe with sorting
 wasmModule.CMD_AT_UNSUBSCRIBE                // Unsubscribe from feeds
 
-// Trading and account management
+// Trading and account management (🔥 Planned for Mini Wolverine)
 wasmModule.CMD_AT_MANUAL_TRADE               // Manual trading operations
 wasmModule.CMD_AT_MANUAL_EDIT                // Edit manual trades
 wasmModule.CMD_AT_ACCOUNT_ADD                // Add trading accounts
 wasmModule.CMD_AT_ACCOUNT_DEL                // Delete trading accounts
 wasmModule.CMD_AT_ACCOUNT_EDIT               // Edit trading accounts
 
-// Backtesting operations
+// Backtesting operations (🔥 Upcoming: Simplified Implementation)
 wasmModule.CMD_AT_START_BACKTEST             // Start backtest
 wasmModule.CMD_AT_CTRL_BACKTEST              // Control backtest execution
 wasmModule.CMD_AT_QUERY_ORDERS               // Query orders
@@ -58,6 +79,7 @@ wasmModule.NAMESPACE_PRIVATE                 // Private namespace (1)
 
 ### NetPackage - Binary Message Handling
 ```javascript
+// 🏗️ Backend Implementation (WasmService.js)
 // Create and manipulate binary network packages
 const pkg = new wasmModule.NetPackage();
 
@@ -68,7 +90,22 @@ pkg.header.cmd                               // Access command from header
 pkg.header.seq                               // Access sequence number
 pkg.content()                                // Get message content
 pkg.length()                                 // Get content length
-pkg.delete()                                 // Cleanup WASM object
+pkg.delete()                                 // ⚠️  CRITICAL: Always cleanup WASM object
+
+// 🔧 Mini Wolverine Usage Example:
+// backend/src/services/WasmService.js
+createKeepaliveMessage() {
+    const pkg = new this.module.NetPackage();
+    const encoded = pkg.encode(this.module.NET_CMD_GOLD_ROUTE_KEEPALIVE, new Uint8Array(0));
+    
+    // Copy to regular ArrayBuffer for WebSocket transmission
+    const regularBuffer = new ArrayBuffer(encoded.byteLength);
+    const regularView = new Uint8Array(regularBuffer);
+    regularView.set(new Uint8Array(encoded));
+    
+    pkg.delete(); // Always cleanup
+    return regularBuffer;
+}
 ```
 
 ### IndexSchema - Schema Management

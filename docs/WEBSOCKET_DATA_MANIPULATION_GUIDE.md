@@ -1,8 +1,17 @@
-# WebSocket Data Manipulation Guide
+# WebSocket Data Manipulation Guide - Mini Wolverine
+
+**Backend WASM + Frontend WebSocket Architecture**
 
 ## Overview
 
-This guide focuses on advanced data manipulation with the Caitlyn WebSocket server using `caitlyn_js.js` and `caitlyn_js.wasm`. It provides comprehensive examples for fetching, subscribing to, and manipulating financial data in real-time.
+This guide focuses on advanced data manipulation within **Mini Wolverine's backend-frontend architecture**. All WASM operations (`caitlyn_js.wasm`) happen in the Node.js backend, with the React frontend communicating via WebSocket API.
+
+**Key Architecture Changes:**
+- **Backend-Only WASM**: All caitlyn_js.wasm operations handled by Node.js WasmService
+- **WebSocket Proxy**: Backend acts as intelligent proxy between frontend and Caitlyn servers
+- **Frontend JSON API**: React frontend receives processed JSON data, not raw WASM
+- **AI-Friendly**: Clean separation allows AI coding agents to easily extend functionality
+- **🔥 Trading Ready**: Architecture supports upcoming simplified trading and automation features
 
 ## Table of Contents
 
@@ -15,17 +24,36 @@ This guide focuses on advanced data manipulation with the Caitlyn WebSocket serv
 7. [Usage Examples](#usage-examples)
 8. [Best Practices](#best-practices)
 
-## Prerequisites
+## Prerequisites - Mini Wolverine Setup
 
-Ensure you have completed the basic setup from `STANDALONE_FRONTEND_DEMO_GUIDE.md` before proceeding with these data manipulation examples.
+**Backend Prerequisites:**
+```bash
+# Start Mini Wolverine backend + frontend
+docker-compose up -d
 
-## Critical: Understanding Schema and Universe Data
+# Verify backend WASM integration
+node backend/test-backend-capabilities.js
 
-**IMPORTANT**: All available fields, markets, and tickers (stock codes) must be retrieved from the server's initialization dataset. You cannot hardcode or guess these values - they are dynamically provided by the Caitlyn server through:
+# Test complete universe initialization
+node examples/test.js --url wss://116.wolverine-box.com/tm --token <your-token>
+```
 
-1. **Schema Definition** - Defines available data fields and their types
-2. **Universe Revision** - Provides namespace and metadata information  
-3. **Universe Seeds** - Contains actual market data including available markets and instrument codes
+**Frontend Prerequisites:**
+- React frontend automatically connects to backend WebSocket (ws://localhost:4000)
+- No WASM setup required in frontend - all handled by backend
+- Use BackendWebSocketContext for all server communication
+
+## Critical: Backend Schema Processing Architecture
+
+**IMPORTANT**: In Mini Wolverine, all schema and universe data processing happens in the **Node.js backend**. The frontend receives processed JSON data via WebSocket.
+
+**Backend Processing Flow:**
+1. **Schema Definition** - WasmService processes 576 metadata objects across 2 namespaces
+2. **Universe Revision** - Backend extracts market metadata with proper WASM memory management
+3. **Universe Seeds** - Automatic processing of 60+ market/qualified_name combinations
+4. **Frontend Updates** - Processed data sent to React frontend via WebSocket events
+
+**No Frontend WASM**: React components only handle UI and receive processed data from backend.
 
 ### Schema-Driven Field Selection
 
@@ -38,64 +66,107 @@ Ensure you have completed the basic setup from `STANDALONE_FRONTEND_DEMO_GUIDE.m
 3. Use schema-based field access in your code
 
 ```javascript
-// schema-manager.js
-class SchemaManager {
-    constructor(module) {
-        this.module = module;
-        this.schema = {};
-        this.availableFields = new Map(); // namespace -> metaID -> fields[]
-        this.availableMarkets = new Set();
-        this.availableInstruments = new Map(); // market -> instruments[]
-        this.fieldTypes = new Map(); // fieldName -> dataType
+// 🏗️ Backend Implementation (backend/src/services/WasmService.js)
+class WasmService {
+    constructor() {
+        this.module = null;
+        this.schema = null;           // Public schema for frontend
+        this.schemaByNamespace = null; // Internal schema for WASM processing
+        this.compressor = null;
+        this.markets = null;
+        this.ready = false;
     }
     
-    processSchema(schemaContent) {
-        try {
-            const schema = new this.module.IndexSchema();
-            schema.load(schemaContent);
+    // Process schema data from Caitlyn server
+    processSchema(content) {
+        // Clean up existing compressor
+        if (this.compressor) {
+            this.compressor.delete();
+            this.compressor = null;
+        }
+        
+        // Create and load schema
+        const schema = new this.module.IndexSchema();
+        schema.load(content);
+        
+        const metas = schema.metas();
+        const metaCount = metas ? metas.size() : 0;
+        logger.info(`Schema contains ${metaCount} metadata definitions`);
+        
+        // Build schema object with proper namespace grouping
+        const schemaData = {};
+        const schemaByNamespace = {}; // For internal lookup
+        
+        for (let i = 0; i < metaCount; i++) {
+            const meta = metas.get(i);
             
-            const metas = schema.metas();
-            const metaSize = metas.size();
+            // Store for internal WASM operations
+            if (schemaByNamespace[meta.namespace] === undefined) {
+                schemaByNamespace[meta.namespace] = {};
+            }
+            schemaByNamespace[meta.namespace][meta.ID] = meta;
             
-            console.log(`Processing ${metaSize} schema metadata definitions`);
+            // Build public schema for frontend
+            const fullName = meta.name || '';
+            const parts = fullName.split('::');
+            const namespace = parts[0] || 'unknown';
+            const displayName = parts[1] || `Unnamed_${meta.ID}`;
             
-            for (let i = 0; i < metaSize; i++) {
-                const meta = metas.get(i);
-                
-                // Store schema structure
-                if (!this.schema[meta.namespace]) {
-                    this.schema[meta.namespace] = {};
-                }
-                
-                const metaInfo = {
-                    id: meta.ID,
-                    namespace: meta.namespace,
-                    name: meta.name,
-                    displayName: meta.displayName,
-                    fields: this.extractFieldInfo(meta.fields)
-                };
-                
-                this.schema[meta.namespace][meta.ID] = metaInfo;
-                
-                // Build field availability maps
-                const fieldKey = `${meta.namespace}:${meta.ID}`;
-                this.availableFields.set(fieldKey, metaInfo.fields);
-                
-                // Store field types for validation
-                metaInfo.fields.forEach(field => {
-                    this.fieldTypes.set(field.name, field.type);
-                });
-                
-                console.log(`Schema Meta: ${meta.namespace}.${meta.name} with ${metaInfo.fields.length} fields`);
+            if (!schemaData[namespace]) {
+                schemaData[namespace] = [];
             }
             
-            return schema; // Return for compressor initialization
-            
-        } catch (error) {
-            console.error('Error processing schema:', error);
-            throw error;
+            schemaData[namespace].push({
+                id: meta.ID,
+                name: displayName,
+                fullName: fullName,
+                namespace: namespace,
+                namespaceId: meta.namespace
+            });
         }
+        
+        // Initialize compressor with schema
+        this.compressor = new this.module.IndexSerializer();
+        this.compressor.updateSchema(schema);
+        
+        // CRITICAL: Delete schema AFTER transferring to compressor
+        schema.delete();
+        
+        // Store schemas
+        this.schema = schemaData;           // For frontend
+        this.schemaByNamespace = schemaByNamespace; // For WASM operations
+        
+        return schemaData;
     }
+    
+    // 🔧 Frontend WebSocket API Usage
+    // frontend-react/src/contexts/BackendWebSocketContext.js
+    
+    // Connect to backend WebSocket
+    const connectToBackend = useCallback(() => {
+        const ws = new WebSocket(process.env.REACT_APP_BACKEND_WS_URL || 'ws://localhost:4000');
+        
+        ws.onmessage = (event) => {
+            const message = JSON.parse(event.data);
+            
+            switch (message.type) {
+                case 'schema_received':
+                    // Backend has processed schema and sent JSON to frontend
+                    dispatch({ type: 'SET_SCHEMA', payload: message.data });
+                    break;
+                    
+                case 'universe_revision':
+                    // Backend has processed markets and sent results
+                    dispatch({ type: 'SET_MARKET_DATA', payload: message.data });
+                    break;
+                    
+                case 'historical_data':
+                    // Backend has processed ATFetchByCode and sent results
+                    dispatch({ type: 'ADD_HISTORICAL_DATA', payload: message.data });
+                    break;
+            }
+        };
+    }, []);
     
     extractFieldInfo(fieldsVector) {
         const fields = [];
