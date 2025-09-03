@@ -1,0 +1,23 @@
+{
+  "name": "mini-wolverine",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A comprehensive demonstration application showcasing financial data processing using WebAssembly, React.js, and modern web technologies. This project serves as both a functional demo and a reference implementation for developers building financial applications with real-time and historical data capabilities.",
+  "main": "test-keepalive.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "node test-frontend-websocket.js",
+    "test-websocket": "node test-frontend-websocket.js",
+    "update-wasm": "node scripts/update-wasm.js",
+    "prebuild": "npm run update-wasm"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "nodejs-websocket": "^1.7.2",
+    "ws": "^8.18.3"
+  }
+}

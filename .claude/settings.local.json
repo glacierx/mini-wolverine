@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker-compose:*)",
+      "Bash(docker network prune:*)",
+      "Bash(docker compose logs:*)",
+      "Bash(curl:*)",
+      "Bash(chmod:*)",
+      "Bash(node:*)",
+      "Bash(npm run update-wasm:*)",
+      "Bash(timeout:*)",
+      "Bash(npm start)",
+      "Bash(npm run test-websocket:*)",
+      "Bash(npm install)",
+      "Bash(docker logs:*)",
+      "Bash(MOCK_MODE=true node test-structvalue-integration.js)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
