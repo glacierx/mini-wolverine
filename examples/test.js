@@ -21,6 +21,7 @@ import ws from 'nodejs-websocket';
 
 // Import SVObject wrapper functionality
 import SVObject from '../backend/src/utils/StructValueWrapper.js';
+import { createSingularityObject } from '../backend/src/utils/SingularityObjects.js';
 
 /**
  * SampleQuote class for processing market quote data
@@ -149,6 +150,9 @@ function setupClientHandlers(client) {
     let expectedSeedsResponses = 0;
     let receivedSeedsResponses = 0;
     let realDataFetchInitiated = false;
+    
+    // Global tracking for securities data
+    const securitiesByMarket = {};
     
     /**
      * Handle text messages (usually handshake responses)
@@ -312,6 +316,9 @@ function setupClientHandlers(client) {
         // Store market data for seeds requests
         const marketsData = {};
         
+        // Create reusable SVObject instances for each metadata type
+        const svObjectCache = {};
+        
         // Process each namespace (global, private)
         for (let i = 0; i < keys.size(); i++) {
             const namespaceKey = keys.get(i);
@@ -331,31 +338,36 @@ function setupClientHandlers(client) {
                     
                     console.log(`  📈 Market: ${marketCode} (${metaName})`);
                     
-                    // Field 7 contains the revisions JSON data (discovered through reverse engineering)
-                    if (!sv.isEmpty(7)) {
+                    // Use MarketData SVObject to properly extract data (reuse instance)
+                    if (!svObjectCache[metaName]) {
+                        svObjectCache[metaName] = createSingularityObject(metaName, caitlyn);
+                        svObjectCache[metaName].loadDefFromDict(_schema);  // Load schema definition once
+                    }
+                    const marketData = svObjectCache[metaName];
+                    marketData.fromSv(sv);
+                    
+                    // Extract data using SVObject's structured approach
+                    const marketJson = marketData.toJSON();
+                    const fields = marketJson.fields;
+                    
+                    if (fields.revs) {
                         try {
-                            const revsJsonString = sv.getString(7);
-                            const revsData = JSON.parse(revsJsonString);
+                            const revsData = JSON.parse(fields.revs);
                             
-                            // Get trade_day from the StructValue (field 0 contains trade_day in Market structure)
-                            let tradeDay = 0;
-                            if (!sv.isEmpty(0)) {
-                                tradeDay = sv.getInt32(0);
-                            }
-                            
-                            // Store market data structure
+                            // Store market data structure using SVObject extracted data
                             if (!marketsData[namespaceKey]) {
                                 marketsData[namespaceKey] = {};
                             }
                             
                             marketsData[namespaceKey][marketCode] = {
                                 revisions: revsData,
-                                trade_day: tradeDay,  // Use actual trade day from response
-                                name: sv.getString(1)  // Field 1 contains display name
+                                trade_day: fields.trade_day || 0,  // From MarketData field
+                                name: fields.name || marketCode     // From MarketData field
                             };
                             
                             const qualifiedNames = Object.keys(revsData);
-                            console.log(`    ├─ Trade day: ${tradeDay}`);
+                            console.log(`    ├─ Trade day: ${fields.trade_day}`);
+                            console.log(`    ├─ Market name: ${fields.name}`);
                             console.log(`    └─ Qualified names: ${qualifiedNames.join(', ')}`);
                             
                         } catch (e) {
@@ -364,6 +376,8 @@ function setupClientHandlers(client) {
                     } else {
                         console.log(`    └─ No revision data available`);
                     }
+                    
+                    // Note: SVObject instance reused - cleanup at end of function
                 }
                 
                 // Clean up StructValue
@@ -375,6 +389,11 @@ function setupClientHandlers(client) {
         res.delete();
         
         console.log(`\n✅ Extracted market data for ${Object.keys(marketsData.global || {}).length} global markets and ${Object.keys(marketsData.private || {}).length} private markets`);
+        
+        // Cleanup reused SVObject instances
+        for (const metaName in svObjectCache) {
+            svObjectCache[metaName].cleanup();
+        }
         
         // Proceed to request universe seeds for all markets
         requestUniverseSeeds(client, marketsData);
@@ -460,18 +479,107 @@ function setupClientHandlers(client) {
         console.log(`📊 Received seeds response with ${seedData.size()} entries`);
         
         if (seedData.size() > 0) {
-            console.log("📋 Seed data entries:");
+            console.log("📋 Processing seed data entries...");
+            
+            // Create reusable SVObject instances for each metadata type
+            const svObjectCache = {};
             
             for (let i = 0; i < seedData.size(); i++) {
                 const entry = seedData.get(i);
+                const market = entry.market;
+                const code = entry.stockCode;
+                
+                // Use SVObject to properly decode the entry if we have schema info
+                if (_schema[entry.namespace] && _schema[entry.namespace][entry.metaID]) {
+                    const metaName = _schema[entry.namespace][entry.metaID].name;
+                    
+                    // Track Security data specifically
+                    if (metaName.includes('Security')) {
+                        // Use the actual market code from the Seeds request, not the response market field
+                        const actualMarket = entry.stockCode;  // This should be the market code
+                        
+                        if (!securitiesByMarket[actualMarket]) {
+                            securitiesByMarket[actualMarket] = [];
+                        }
+                        
+                        try {
+                            // Create appropriate SVObject for this metadata type (reuse instance)
+                            if (!svObjectCache[metaName]) {
+                                svObjectCache[metaName] = createSingularityObject(metaName, caitlyn);
+                                svObjectCache[metaName].loadDefFromDict(_schema);  // Load schema definition once
+                            }
+                            const svObject = svObjectCache[metaName];
+                            svObject.fromSv(entry);
+                            
+                            // Extract data using SVObject
+                            const objectData = svObject.toJSON();
+                            
+                            // Debug: Show what fields are available
+                            if (i === 0 && metaName.includes('Security')) {  // Debug first Security entry
+                                console.log(`    🔍 DEBUG: Security fields available: ${Object.keys(objectData.fields || {}).join(', ')}`);
+                                console.log(`    🔍 DEBUG: Sample field values:`, objectData.fields);
+                            }
+                            
+                            // Store Security data - check for various possible field names
+                            if (objectData.fields) {
+                                const securityData = {
+                                    code: code,  // The stock code from the entry
+                                    market: actualMarket,
+                                    codes: objectData.fields.code || [],  // Security codes (singular 'code' field)
+                                    names: objectData.fields.name || [],  // Security names
+                                    abbreviations: objectData.fields.abbreviation || [],
+                                    categories: objectData.fields.category || [],
+                                    states: objectData.fields.state || [],
+                                    lastClose: objectData.fields.last_close || [],
+                                    dividendRatio: objectData.fields.dividend_ratio || [],
+                                    tradeDay: objectData.fields.trade_day,
+                                    rev: objectData.fields.rev
+                                };
+                                
+                                // Always add the Security data, even if vectors are empty (shows structure)
+                                securitiesByMarket[actualMarket].push(securityData);
+                            }
+                            
+                        } catch (e) {
+                            console.log(`    ⚠️ Error processing Security SVObject: ${e.message}`);
+                        }
+                    }
+                    
+                    // Log summary info for non-Security types
+                    if (i < 5 || metaName.includes('Market')) {  // Show first few entries and all Market entries
+                        console.log(`  Entry ${i + 1}: ${market}/${code} - ${metaName}`);
+                        
+                        try {
+                            if (!svObjectCache[metaName]) {
+                                svObjectCache[metaName] = createSingularityObject(metaName, caitlyn);
+                                svObjectCache[metaName].loadDefFromDict(_schema);
+                            }
+                            const svObject = svObjectCache[metaName];
+                            svObject.fromSv(entry);
+                            const objectData = svObject.toJSON();
+                            
+                            if (objectData.fields) {
+                                if (metaName.includes('Market') && objectData.fields.name) {
+                                    console.log(`    🏷️ Market Name: ${objectData.fields.name}`);
+                                }
+                            }
+                        } catch (e) {
+                            // Silent catch for non-critical display
+                        }
+                    }
+                    
+                } else {
+                    if (i < 5) {  // Only log first few unknown entries
+                        console.log(`  Entry ${i + 1}: Unknown type (metaID: ${entry.metaID})`);
+                    }
+                }
+                
                 // Clean up entry after use
                 entry.delete();
-                console.log(`  Entry ${i + 1}:`);
-                
-                // Note: The exact structure of seed entries depends on the specific
-                // metadata definition and would need further analysis to fully decode
-                // For now, we just log that we received the data
-                console.log(`    └─ StructValue entry received`);
+            }
+            // Cleanup reused SVObject instances
+            for (const metaName in svObjectCache) {
+                svObjectCache[metaName].cleanup();
             }
         } else {
             console.log("  └─ No seed data in this response (may be empty market)");
@@ -498,6 +606,63 @@ function setupClientHandlers(client) {
             console.log('   4. ✅ Universe revision data extracted');
             console.log('   5. ✅ Universe seeds requests sent for all markets');
             console.log('   6. ✅ Universe seeds responses received and processed');
+            
+            // Display Security data summary
+            console.log('\n📊 ===== SECURITY DATA SUMMARY =====');
+            const marketList = Object.keys(securitiesByMarket).sort();
+            console.log(`Found Security data for ${marketList.length} markets:\n`);
+            
+            for (const market of marketList) {
+                const securities = securitiesByMarket[market];
+                console.log(`🏪 ${market}: ${securities.length} securities`);
+                
+                if (securities.length > 0) {
+                    // Show details of first security
+                    const firstSecurity = securities[0];
+                    console.log(`   Security data structure:`);
+                    console.log(`     - Market Code: ${firstSecurity.code}`);
+                    console.log(`     - Security Codes Count: ${firstSecurity.codes.length}`);
+                    console.log(`     - Security Names Count: ${firstSecurity.names.length}`);
+                    console.log(`     - Trade Day: ${firstSecurity.tradeDay}`);
+                    console.log(`     - Revision: ${firstSecurity.rev}`);
+                    
+                    // Show sample codes if available
+                    if (firstSecurity.codes.length > 0) {
+                        const sampleCodes = firstSecurity.codes.slice(0, 5);
+                        console.log(`     - Sample codes: [${sampleCodes.join(', ')}${firstSecurity.codes.length > 5 ? '...' : ''}]`);
+                    }
+                    
+                    // Show sample names if available
+                    if (firstSecurity.names.length > 0) {
+                        const sampleNames = firstSecurity.names.slice(0, 3);
+                        console.log(`     - Sample names: [${sampleNames.join(', ')}${firstSecurity.names.length > 3 ? '...' : ''}]`);
+                    }
+                }
+                console.log();  // Empty line between markets
+            }
+            
+            // Show specific market example (DCE)
+            if (securitiesByMarket['DCE']) {
+                console.log('🎯 DCE (Dalian Commodity Exchange) Security Details:');
+                const dceSecurities = securitiesByMarket['DCE'];
+                console.log(`   Total securities: ${dceSecurities.length}`);
+                
+                // Show more DCE securities
+                console.log(`   Security structure details:`);
+                dceSecurities.forEach((sec, idx) => {
+                    console.log(`     Security ${idx + 1}:`);
+                    console.log(`       - Market Code: ${sec.code}`);
+                    console.log(`       - Security Codes: ${sec.codes.length} items`);
+                    console.log(`       - Security Names: ${sec.names.length} items`);
+                    if (sec.codes.length > 0) {
+                        console.log(`       - First few codes: [${sec.codes.slice(0, 3).join(', ')}${sec.codes.length > 3 ? '...' : ''}]`);
+                    }
+                    if (sec.names.length > 0) {
+                        console.log(`       - First few names: [${sec.names.slice(0, 2).join(', ')}${sec.names.length > 2 ? '...' : ''}]`);
+                    }
+                });
+            }
+            
             console.log('\n🚀 Proceeding to historical data fetching...');
             
             // Fetch real StructValue data using WASM APIs and demonstrate SVObject integration

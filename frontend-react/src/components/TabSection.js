@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import styled from 'styled-components';
 import { useData } from '../contexts/DataContext';
 import { useBackendWebSocket } from '../contexts/BackendWebSocketContext';
+import HistoricalDataQuery from './HistoricalDataQuery';
 
 const TabsContainer = styled.section`
   background: var(--card-background);
@@ -292,7 +293,7 @@ function TabSection() {
         return (
           <div>
             <PanelHeader>
-              <PanelTitle>📊 Historical Data</PanelTitle>
+              <PanelTitle>📊 Historical Data Query</PanelTitle>
               <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
                 <select style={{ padding: '6px 10px', borderRadius: '4px', border: '1px solid var(--border-color)' }}>
                   <option value="table">Table View</option>
@@ -301,11 +302,7 @@ function TabSection() {
                 <button className="btn btn-mini btn-secondary">Export Data</button>
               </div>
             </PanelHeader>
-            <PlaceholderContent>
-              <p><strong>Historical Data Visualization Placeholder</strong></p>
-              <p>This section will display historical market data in table and chart formats.</p>
-              <p>Use the Historical Data controls in the Actions section to fetch data.</p>
-            </PlaceholderContent>
+            <HistoricalDataQuery />
           </div>
         );
         

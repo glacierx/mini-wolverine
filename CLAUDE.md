@@ -349,6 +349,133 @@ try {
 10. **No Try-catch to `stablize` the system**: Always let the errors surface with full callstack to help human see and debug. THIS IS CRITICAL!!
 11. **No fallback to patch possible error**: Always NOT use fallbacks to patch possible system flaw or error, just let it crash. THIS IS CRITICAL!!
 
+#### Mock data as fallback
+
+1. **DON'T MAKE MOCK DATA AS FALLBACK**: CRITICAL! Just let the system fail and let me see the error. Making mock data to patch is HARMFUL!
+
+##### SVObject Doctrine - MANDATORY for All StructValue Processing
+
+**🚫 NEVER manipulate StructValue objects directly** - Always use SVObject subclasses for all Caitlyn data processing.
+
+**✅ REQUIRED SVObject Pattern with Reuse:**
+
+```javascript
+// 1. Create reusable SVObject cache (once per function/scope)
+const svObjectCache = {};
+
+// 2. Create or reuse SVObject instance
+if (!svObjectCache[qualifiedName]) {
+  svObjectCache[qualifiedName] = createSingularityObject(qualifiedName, wasmModule);
+  svObjectCache[qualifiedName].loadDefFromDict(schemaByNamespace);  // Load schema once
+}
+
+// 3. Reuse existing SVObject instance
+const svObject = svObjectCache[qualifiedName];
+svObject.fromSv(structValue);  // Extract data from current StructValue
+
+// 4. Access structured data
+const objectData = svObject.toJSON();
+const fieldValue = objectData.fields.fieldName;
+
+// 5. Cleanup all cached instances at end of scope (MANDATORY)
+for (const metaName in svObjectCache) {
+  svObjectCache[metaName].cleanup();
+}
+```
+
+**🏗️ SVObject Initialization Steps:**
+
+1. **Import Required Classes:**
+
+   ```javascript
+   import { createSingularityObject } from '../utils/SingularityObjects.js';
+   ```
+
+2. **Schema Availability Check:**
+
+   ```javascript
+   if (schemaByNamespace[namespace] && schemaByNamespace[namespace][metaID]) {
+     const meta = schemaByNamespace[namespace][metaID];
+     const qualifiedName = meta.name; // e.g., "global::Market"
+   }
+   ```
+
+3. **SVObject Creation and Schema Loading:**
+
+   ```javascript
+   const svObject = createSingularityObject(qualifiedName, wasmModule);
+   svObject.loadDefFromDict(schemaByNamespace);  // Schema-driven field definitions
+   ```
+
+4. **Data Extraction:**
+
+   ```javascript
+   svObject.fromSv(structValue);  // Safe field extraction using schema
+   const data = svObject.toJSON(); // Structured field access
+   ```
+
+5. **Memory Management:**
+
+   ```javascript
+   svObject.cleanup();  // Always cleanup - prevents memory leaks
+   ```
+
+**📋 Available Singularity SVObject Types:**
+
+- `MarketData` (global::Market, private::Market)
+- `HolidayData` (global::Holiday, private::Holiday)
+- `SecurityData` (global::Security, private::Security)
+- `CommodityData` (global::Commodity, private::Commodity)
+- `FutureData` (global::Future, private::Future)
+- `StockData` (global::Stock, private::Stock)
+- `DividendData` (global::Dividend, private::Dividend)
+
+**❌ FORBIDDEN Direct StructValue Patterns:**
+
+```javascript
+// NEVER do this:
+const value = sv.getString(7);      // ❌ Hardcoded field positions
+const tradeDay = sv.getInt32(0);    // ❌ Direct field access
+if (!sv.isEmpty(1)) { ... }         // ❌ Manual field checking
+```
+
+**✅ CORRECT SVObject Patterns:**
+
+```javascript
+// Always do this:
+const marketData = createSingularityObject("global::Market", wasmModule);
+marketData.loadDefFromDict(schemaByNamespace);
+marketData.fromSv(sv);
+const fields = marketData.toJSON().fields;
+const tradeDay = fields.trade_day;   // ✅ Schema-driven field access
+const name = fields.name;            // ✅ Named field access
+marketData.cleanup();
+```
+
+**🎯 Benefits of SVObject Doctrine:**
+
+- **Field Alignment Safety**: No crashes from schema mismatches
+- **Schema Compliance**: All data extraction follows server schema
+- **Code Consistency**: Same pattern across all components
+- **Memory Safety**: Proper WASM object lifecycle management
+- **Maintainability**: Easy to extend for new metadata types
+- **Performance Optimization**: Instance reuse reduces object creation overhead
+
+**⚡ SVObject Reuse Guidelines:**
+
+1. **Create Cache Once**: Initialize `svObjectCache = {}` at function start
+2. **Reuse by Qualified Name**: Cache key should be full qualified name (e.g., "global::Market")
+3. **Load Schema Once**: Call `loadDefFromDict()` only when creating new instances
+4. **Multiple fromSv() Calls**: Same SVObject can process multiple StructValues
+5. **Cleanup at End**: Always cleanup all cached instances when function completes
+6. **Scope-Based Caching**: Create cache per function/method scope, not globally
+
+**📊 Performance Impact:**
+- **Before**: Creating 100 Market objects = 100 object creations + 100 schema loads
+- **After**: Processing 100 Markets = 1 object creation + 1 schema load + 100 data extractions
+- **Memory Savings**: ~90% reduction in WASM object allocations
+- **Speed Improvement**: Faster processing due to reduced object creation overhead
+
 ### Testing and Debugging
 
 #### **Backend Testing Suite**

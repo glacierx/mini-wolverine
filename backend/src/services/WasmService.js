@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import logger from '../utils/logger.js';
+import { createSingularityObject } from '../utils/SingularityObjects.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -13,6 +14,7 @@ class WasmService {
     this.schemaByNamespace = null; // Internal schema for processing
     this.compressor = null;
     this.markets = null;
+    this.futuresIndex = null; // Index of futures contracts by market
     this.ready = false;
   }
 
@@ -120,19 +122,34 @@ class WasmService {
         // Count namespaces
         namespaceCounts[namespace] = (namespaceCounts[namespace] || 0) + 1;
         
-        // Build public schema structure
-        if (!schemaData[namespace]) {
-          schemaData[namespace] = [];
+        // Build public schema structure using numeric namespace keys (frontend expects this format)
+        const namespaceKey = meta.namespace.toString();
+        if (!schemaData[namespaceKey]) {
+          schemaData[namespaceKey] = {};
         }
         
-        schemaData[namespace].push({
-          id: meta.ID,
-          name: displayName,
-          fullName: fullName,
+        // Extract field definitions from meta
+        const fields = [];
+        if (meta.fields) {
+          const fieldVector = meta.fields;
+          const fieldCount = fieldVector.size();
+          
+          for (let j = 0; j < fieldCount; j++) {
+            const field = fieldVector.get(j);
+            fields.push({
+              name: field.name || `field_${j}`,
+              type: field.type || 'unknown'
+            });
+          }
+        }
+        
+        schemaData[namespaceKey][meta.ID] = {
+          name: fullName,
+          displayName: displayName,
           namespace: namespace,
-          namespaceId: meta.namespace, // numeric namespace for internal use
-          fields: [] // Will be populated if needed
-        });
+          namespaceId: meta.namespace,
+          fields: fields
+        };
       }
     }
     
@@ -157,7 +174,7 @@ class WasmService {
     return schemaData;
   }
 
-  // Process universe revision data
+  // Process universe revision data using global::Market
   processUniverseRevision(content) {
     if (!this.ready || !this.compressor) {
       throw new Error('WASM module or compressor not initialized');
@@ -174,6 +191,9 @@ class WasmService {
     
     const marketsData = {};
     
+    // Create reusable SVObject instances for each metadata type
+    const svObjectCache = {};
+    
     // Process each namespace
     for (let i = 0; i < keys.size(); i++) {
       const namespaceKey = keys.get(i);
@@ -185,100 +205,225 @@ class WasmService {
       // Process each StructValue
       for (let j = 0; j < structValues.size(); j++) {
         const sv = structValues.get(j);
+        const marketCode = sv.stockCode;
         
-        // Look for Market metadata (ID 3)
-        if (sv.metaID === 3 && this.schemaByNamespace && this.schemaByNamespace[namespaceId] && this.schemaByNamespace[namespaceId][sv.metaID]) {
+        // Check if this is Market metadata and has schema info
+        if (this.schemaByNamespace[namespaceId] && this.schemaByNamespace[namespaceId][sv.metaID]) {
           const meta = this.schemaByNamespace[namespaceId][sv.metaID];
-          const metaName = meta.name || 'Market';
-          const marketCode = sv.stockCode;
+          const qualifiedName = meta.name;
           
-          logger.debug(`Market: ${marketCode} (${metaName})`);
-          
-          // Field 7 contains the revisions JSON data
-          if (!sv.isEmpty(7)) {
-            const revsJsonString = sv.getString(7);
-            const revsData = JSON.parse(revsJsonString);
+          // Only process Market types
+          if (qualifiedName.includes('::Market')) {
+            logger.debug(`Market: ${marketCode} (${qualifiedName})`);
             
-            // Get trade_day from field 0
-            let tradeDay = 0;
-            if (!sv.isEmpty(0)) {
-              tradeDay = sv.getInt32(0);
+            // Use SVObject pattern to extract data properly (reuse instance)
+            if (!svObjectCache[qualifiedName]) {
+              svObjectCache[qualifiedName] = createSingularityObject(qualifiedName, this.module);
+              svObjectCache[qualifiedName].loadDefFromDict(this.schemaByNamespace);  // Load schema definition once
+            }
+            const marketData = svObjectCache[qualifiedName];
+            marketData.fromSv(sv);
+            
+            // Extract data using SVObject's structured approach
+            const marketJson = marketData.toJSON();
+            const fields = marketJson.fields;
+            
+            if (fields.revs) {
+              const revsData = JSON.parse(fields.revs);
+              const tradeDay = fields.trade_day || 0;
+              const displayName = fields.name || marketCode;
+              
+              if (!marketsData[namespaceKey]) {
+                marketsData[namespaceKey] = {};
+              }
+              
+              marketsData[namespaceKey][marketCode] = {
+                revisions: revsData,
+                trade_day: tradeDay,
+                name: displayName
+              };
             }
             
-            // Store market data
-            if (!marketsData[namespaceKey]) {
-              marketsData[namespaceKey] = {};
-            }
-            
-            marketsData[namespaceKey][marketCode] = {
-              revisions: revsData,
-              trade_day: tradeDay,
-              name: sv.getString(1)
-            };
+            // Note: SVObject instance reused - cleanup at end of function
           }
         }
         
-        // Clean up StructValue
         sv.delete();
       }
     }
     
-    // Clean up response
     universeRes.delete();
     
     const globalCount = Object.keys(marketsData.global || {}).length;
     const privateCount = Object.keys(marketsData.private || {}).length;
     logger.info(`Extracted market data for ${globalCount} global markets and ${privateCount} private markets`);
     
+    // Cleanup reused SVObject instances
+    for (const qualifiedName in svObjectCache) {
+      svObjectCache[qualifiedName].cleanup();
+    }
+    
     this.markets = marketsData;
     return marketsData;
   }
+  
+  // Note: findMetaByQualifiedName removed - now using SVObject pattern with schema lookup
 
-  // Process universe seeds data
+  // Process universe seeds data and index available contracts
   processUniverseSeeds(content) {
     if (!this.ready || !this.compressor) {
       throw new Error('WASM module or compressor not initialized');
     }
     
-    // Check content size before processing
     if (!content || content.byteLength === 0) {
       logger.warn('Empty content received for universe seeds');
-      return { count: 0, total: 0 };
+      return { count: 0, total: 0, futures: {} };
     }
     
-    // Log content size for debugging
     logger.debug(`Processing seeds content of size: ${content.byteLength} bytes`);
     
     const seedsRes = new this.module.ATUniverseSeedsRes();
     seedsRes.setCompressor(this.compressor);
     seedsRes.decode(content);
     
-    // Get seed data
     const seedData = seedsRes.seedData();
-    const seedCount = seedData ? seedData.size() : 0;
+    const seedCount = seedData.size();
     logger.debug(`Seeds response contains ${seedCount} entries`);
     
     let processedCount = 0;
     
-    // Only process if we have reasonable amount of data
-    if (seedCount > 0 && seedCount < 10000) {  // Sanity check - prevent huge arrays
-      for (let i = 0; i < seedCount; i++) {
-        const entry = seedData.get(i);
-        // Immediately clean up entry
-        if (entry) {
-          entry.delete();
+    // Use persistent index that accumulates across all universe seeds responses
+    if (!this.futuresIndex) {
+      this.futuresIndex = {}; // Initialize once
+    }
+    const securityIndex = this.futuresIndex; // Reference to persistent index
+    
+    // Create reusable SVObject instances for each metadata type
+    const svObjectCache = {};
+    
+    for (let i = 0; i < seedCount; i++) {
+      const entry = seedData.get(i);
+      
+      const market = entry.stockCode;  // The stockCode contains the actual market code (DCE, CFFEX, etc.)
+      const code = entry.stockCode;    // For now, use market code as the code - will be enriched by SVObject data
+      const metaID = entry.metaID;
+      const namespace = entry.namespace;
+      
+      if (market && code) {
+        // Get metadata to determine contract type
+        let contractType = 'Unknown';
+        let qualifiedName = 'Unknown';
+        
+        if (this.schemaByNamespace[namespace] && this.schemaByNamespace[namespace][metaID]) {
+          const meta = this.schemaByNamespace[namespace][metaID];
+          qualifiedName = meta.name;
+          
+          const nameParts = qualifiedName.split('::');
+          if (nameParts.length >= 2) {
+            contractType = nameParts[1]; // e.g., "Futures", "Security", etc.
+          }
         }
-        processedCount++;
+        
+        if (!securityIndex[market]) {
+          securityIndex[market] = [];
+        }
+        
+        const contractData = {
+          code: code,
+          metaID: metaID,
+          namespace: namespace,
+          type: contractType,
+          timeTag: entry.timeTag || 0,
+          granularity: entry.granularity || 0
+        };
+        
+        // Use SVObject pattern to extract data properly (reuse instance)
+        if (!svObjectCache[qualifiedName]) {
+          svObjectCache[qualifiedName] = createSingularityObject(qualifiedName, this.module);
+          svObjectCache[qualifiedName].loadDefFromDict(this.schemaByNamespace);  // Load schema definition once
+        }
+        const svObject = svObjectCache[qualifiedName];
+        svObject.fromSv(entry);
+        
+        // Convert SVObject to JSON for easy access
+        const objectData = svObject.toJSON();
+        
+        // For Security data, create individual entries for each security code
+        if (contractType === 'Security' && objectData.fields && objectData.fields.code && objectData.fields.code.length > 0) {
+          // Extract individual securities from the Security vectors
+          for (let j = 0; j < objectData.fields.code.length; j++) {
+            const securityData = {
+              code: objectData.fields.code[j],  // Individual security code
+              name: objectData.fields.name && objectData.fields.name[j] ? objectData.fields.name[j] : objectData.fields.code[j],
+              metaID: metaID,
+              namespace: namespace,
+              type: contractType,
+              timeTag: entry.timeTag || 0,
+              granularity: entry.granularity || 0,
+              // Additional Security-specific fields
+              abbreviation: objectData.fields.abbreviation && objectData.fields.abbreviation[j] ? objectData.fields.abbreviation[j] : null,
+              category: objectData.fields.category && objectData.fields.category[j] ? objectData.fields.category[j] : null,
+              state: objectData.fields.state && objectData.fields.state[j] ? objectData.fields.state[j] : null,
+              lastClose: objectData.fields.last_close && objectData.fields.last_close[j] ? objectData.fields.last_close[j] : null,
+              svData: {
+                rev: objectData.fields.rev,
+                trade_day: objectData.fields.trade_day,
+                totalSecurities: objectData.fields.code.length
+              }
+            };
+            securityIndex[market].push(securityData);
+          }
+        } else {
+          // For non-Security data or empty Security data, use original logic
+          // Extract commonly available fields from SVObject
+          if (objectData.fields) {
+            // For Market: name field is the display name
+            if (contractType === 'Market' && objectData.fields.name) {
+              contractData.name = objectData.fields.name;
+            }
+            
+            // For Future: names field contains contract names
+            if (contractType === 'Futures' && objectData.fields.names && objectData.fields.names.length > 0) {
+              contractData.name = objectData.fields.names[0];
+            }
+            
+            // For Stock: names field contains company names
+            if (contractType === 'Stock' && objectData.fields.names && objectData.fields.names.length > 0) {
+              contractData.name = objectData.fields.names[0];
+            }
+            
+            // For Commodity: codes field contains the identifiers
+            if (contractType === 'Commodity' && objectData.fields.codes && objectData.fields.codes.length > 0) {
+              contractData.name = objectData.fields.codes[0];
+            }
+            
+            // Store complete SVObject data for advanced usage
+            contractData.svData = objectData.fields;
+          }
+          
+          securityIndex[market].push(contractData);
+        }
+        logger.debug(`Indexed contract: ${market}/${code} (${contractType}) - ${contractData.name || 'no name'}`);
       }
-    } else if (seedCount >= 10000) {
-      logger.warn(`Unusually large seed count (${seedCount}), skipping processing to prevent memory issues`);
+      
+      entry.delete();
+      processedCount++;
     }
     
-    // Cleanup
     seedsRes.delete();
     
-    logger.info(`Successfully processed ${processedCount} seed entries`);
-    return { count: processedCount, total: seedCount };
+    // Note: this.futuresIndex is already updated by reference through securityIndex
+    // No need to reassign as it would overwrite accumulated data
+    
+    const totalContracts = Object.values(this.futuresIndex).reduce((sum, contracts) => sum + contracts.length, 0);
+    logger.info(`Successfully processed ${processedCount} seed entries, total indexed: ${totalContracts} securities across ${Object.keys(this.futuresIndex).length} markets`);
+    
+    // Cleanup reused SVObject instances
+    for (const qualifiedName in svObjectCache) {
+      svObjectCache[qualifiedName].cleanup();
+    }
+    
+    return { count: processedCount, total: seedCount, securities: this.futuresIndex };
   }
 
   // Create encoded messages
@@ -363,6 +508,189 @@ class WasmService {
     return regularBuffer;
   }
 
+  // Create historical data request by code (following test.js pattern)
+  createHistoricalDataByCodeRequest(token, sequenceId, market, code, qualifiedName, namespace, granularity, startTime, endTime, fields) {
+    if (!this.ready) {
+      throw new Error('WASM module not initialized');
+    }
+    
+    // Create ATFetchByCode request following test.js pattern
+    const fetchByCodeReq = new this.module.ATFetchByCodeReq();
+    
+    // Set request parameters based on test.js
+    fetchByCodeReq.token = token;
+    fetchByCodeReq.seq = sequenceId;
+    fetchByCodeReq.namespace = namespace === 0 ? 'global' : 'private';
+    fetchByCodeReq.qualifiedName = qualifiedName || 'SampleQuote'; // Default to SampleQuote
+    fetchByCodeReq.revision = -1; // Default revision
+    fetchByCodeReq.market = market;
+    fetchByCodeReq.code = code;
+    fetchByCodeReq.granularity = granularity;
+    
+    // Set fields using StringVector
+    const fieldsVector = new this.module.StringVector();
+    if (fields && Array.isArray(fields)) {
+      fields.forEach(field => fieldsVector.push_back(field));
+    } else {
+      // Default fields for SampleQuote
+      ['open', 'close', 'high', 'low', 'volume', 'turnover'].forEach(field => fieldsVector.push_back(field));
+    }
+    fetchByCodeReq.fields = fieldsVector;
+    
+    // Set time range (convert to milliseconds if needed)
+    fetchByCodeReq.fromTimeTag = startTime.toString();
+    fetchByCodeReq.toTimeTag = endTime.toString();
+    
+    // Encode and create message
+    const pkg = new this.module.NetPackage();
+    const encodedReq = fetchByCodeReq.encode();
+    const encodedPkg = pkg.encode(this.module.CMD_AT_FETCH_BY_CODE, encodedReq);
+    
+    // Copy to regular ArrayBuffer
+    const regularBuffer = new ArrayBuffer(encodedPkg.byteLength);
+    const regularView = new Uint8Array(regularBuffer);
+    const encodedView = new Uint8Array(encodedPkg);
+    regularView.set(encodedView);
+    
+    // Cleanup WASM objects
+    fetchByCodeReq.delete();
+    pkg.delete();
+    fieldsVector.delete();
+    
+    return regularBuffer;
+  }
+
+  // Create historical data request by time range
+  createHistoricalDataByTimeRangeRequest(token, sequenceId, market, code, metaID, granularity, startTime, endTime, limit) {
+    if (!this.ready) {
+      throw new Error('WASM module not initialized');
+    }
+    
+    const pkg = new this.module.NetPackage();
+    
+    const requestData = {
+      token: token,
+      sequence: sequenceId,
+      market: market,
+      code: code,
+      metaID: metaID,
+      granularity: granularity,
+      startTime: startTime,
+      endTime: endTime,
+      limit: limit || 1000
+    };
+    
+    const requestJson = JSON.stringify(requestData);
+    const requestBuffer = new TextEncoder().encode(requestJson);
+    
+    const encodedPkg = pkg.encode(this.module.CMD_AT_FETCH_BY_TIME_RANGE, requestBuffer);
+    
+    // Copy to regular ArrayBuffer
+    const regularBuffer = new ArrayBuffer(encodedPkg.byteLength);
+    const regularView = new Uint8Array(regularBuffer);
+    const encodedView = new Uint8Array(encodedPkg);
+    regularView.set(encodedView);
+    
+    pkg.delete();
+    
+    return regularBuffer;
+  }
+
+  // Process CMD_AT_FETCH_BY_CODE response (following test.js pattern)
+  processHistoricalDataResponse(content) {
+    if (!this.ready || !this.compressor) {
+      throw new Error('WASM module or compressor not initialized');
+    }
+    
+    // Create and decode ATFetchSVRes response
+    const res = new this.module.ATFetchSVRes();
+    res.setCompressor(this.compressor);
+    res.decode(content);
+    
+    // Extract StructValue results
+    const results = res.results();
+    const resultCount = results.size();
+    
+    logger.info(`Received ${resultCount} StructValues from server`);
+    
+    const records = [];
+    
+    // Process each StructValue using SVObject pattern
+    for (let i = 0; i < resultCount; i++) {
+      const sv = results.get(i);
+      
+      // Create record with basic info
+      const record = {
+        timestamp: sv.timeTag,
+        market: sv.market,
+        code: sv.stockCode,
+        metaID: sv.metaID,
+        namespace: sv.namespace
+      };
+      
+      // Use SVObject to extract data if we have schema info
+      if (this.schemaByNamespace[sv.namespace] && this.schemaByNamespace[sv.namespace][sv.metaID]) {
+        const meta = this.schemaByNamespace[sv.namespace][sv.metaID];
+        const qualifiedName = meta.name;
+        
+        // For SampleQuote or similar structures, use SVObject
+        if (qualifiedName.includes('SampleQuote') || qualifiedName.includes('Quote')) {
+          const svObject = createSingularityObject(qualifiedName, this.module);
+          svObject.loadDefFromDict(this.schemaByNamespace);
+          svObject.fromSv(sv);
+          
+          // Extract data using SVObject
+          const objectData = svObject.toJSON();
+          if (objectData.fields) {
+            record.open = objectData.fields.open;
+            record.close = objectData.fields.close;
+            record.high = objectData.fields.high;
+            record.low = objectData.fields.low;
+            record.volume = objectData.fields.volume;
+            record.turnover = objectData.fields.turnover;
+          }
+          
+          svObject.cleanup();
+        } else {
+          // For other types, extract available fields generically
+          const svObject = createSingularityObject(qualifiedName, this.module);
+          svObject.loadDefFromDict(this.schemaByNamespace);
+          svObject.fromSv(sv);
+          
+          const objectData = svObject.toJSON();
+          record.svData = objectData.fields; // Store all extracted fields
+          
+          svObject.cleanup();
+        }
+      }
+      
+      // Calculate derived values for OHLCV data
+      if (record.open && record.close) {
+        record.change = record.close - record.open;
+        record.changePercent = (record.change / record.open) * 100;
+      }
+      
+      if (record.high && record.low && record.close) {
+        record.typicalPrice = (record.high + record.low + record.close) / 3;
+      }
+      
+      records.push(record);
+      sv.delete();
+    }
+    
+    res.delete();
+    
+    return {
+      success: true,
+      data: {
+        records: records,
+        totalCount: resultCount,
+        requestTime: new Date().toISOString()
+      },
+      count: records.length
+    };
+  }
+
   // Decode binary messages
   decodeMessage(arrayBuffer) {
     if (!this.ready) {
@@ -428,6 +756,43 @@ class WasmService {
     return this.markets;
   }
 
+  getFutures() {
+    return this.futuresIndex;
+  }
+
+  // Get futures codes for a specific market
+  getFuturesForMarket(market) {
+    return this.futuresIndex ? (this.futuresIndex[market] || []) : [];
+  }
+
+  // Get all available markets with futures
+  getMarketsWithFutures() {
+    return this.futuresIndex ? Object.keys(this.futuresIndex) : [];
+  }
+
+  // Search securities by code pattern
+  searchSecurities(codePattern, market = null) {
+    if (!this.securityIndex) return [];
+    
+    const pattern = new RegExp(codePattern, 'i'); // case-insensitive
+    const results = [];
+    
+    const marketsToSearch = market ? [market] : Object.keys(this.securityIndex);
+    
+    for (const mkt of marketsToSearch) {
+      const securities = this.securityIndex[mkt] || [];
+      const matches = securities.filter(security => pattern.test(security.code) || (security.name && pattern.test(security.name)));
+      results.push(...matches.map(s => ({ ...s, market: mkt })));
+    }
+    
+    return results;
+  }
+  
+  // Backward compatibility alias
+  searchFutures(codePattern, market = null) {
+    return this.searchSecurities(codePattern, market);
+  }
+
   // Cleanup
   cleanup() {
     if (this.compressor) {
@@ -437,6 +802,7 @@ class WasmService {
     this.schema = null;
     this.schemaByNamespace = null;
     this.markets = null;
+    this.futuresIndex = null;
   }
 }
 

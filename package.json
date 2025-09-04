@@ -17,6 +17,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "node-fetch": "^3.3.2",
     "nodejs-websocket": "^1.7.2",
     "ws": "^8.18.3"
   }

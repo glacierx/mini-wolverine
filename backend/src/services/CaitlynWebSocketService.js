@@ -23,6 +23,27 @@ class CaitlynWebSocketService {
     this.clients = new Set();
     this.globalToken = null;
     this.currentUrl = null;
+    
+    // Sequence ID management for Caitlyn protocol
+    this.sequenceCounter = 1; // Start from 1, increment for each request
+    this.maxSequenceId = 2147483647; // Max 32-bit signed integer
+  }
+
+  /**
+   * Get next sequence ID for Caitlyn protocol requests
+   * Ensures proper sequence tracking within 32-bit integer limits
+   */
+  getNextSequenceId() {
+    const current = this.sequenceCounter;
+    this.sequenceCounter++;
+    
+    // Wrap around if we reach the max value (unlikely but safe)
+    if (this.sequenceCounter > this.maxSequenceId) {
+      this.sequenceCounter = 1;
+      logger.warn('Sequence counter wrapped around to 1');
+    }
+    
+    return current;
   }
 
   async initializePoolOnce(url, token) {
@@ -395,19 +416,27 @@ class ClientHandler {
       limited[namespaceStr] = {};
       const markets = Object.keys(marketsData[namespaceStr]);
       
-      // Take only first 2 markets from each namespace for testing
-      for (let i = 0; i < Math.min(2, markets.length); i++) {
+      // Process all markets in namespace
+      for (let i = 0; i < markets.length; i++) {
         const marketCode = markets[i];
         const marketInfo = marketsData[namespaceStr][marketCode];
         
-        // Take only first 2 qualified names from each market
+        // Include Security data for proper futures/securities display
         if (marketInfo.revisions) {
           const qualifiedNames = Object.keys(marketInfo.revisions);
           const limitedRevisions = {};
           
-          for (let j = 0; j < Math.min(2, qualifiedNames.length); j++) {
+          // Always include Security if available, plus first few others
+          if (marketInfo.revisions['Security']) {
+            limitedRevisions['Security'] = marketInfo.revisions['Security'];
+          }
+          
+          // Add other qualified names (up to 3 total including Security)
+          for (let j = 0; j < qualifiedNames.length && Object.keys(limitedRevisions).length < 3; j++) {
             const qualName = qualifiedNames[j];
-            limitedRevisions[qualName] = marketInfo.revisions[qualName];
+            if (qualName !== 'Security') {  // Don't duplicate Security
+              limitedRevisions[qualName] = marketInfo.revisions[qualName];
+            }
           }
           
           limited[namespaceStr][marketCode] = {

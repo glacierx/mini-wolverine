@@ -100,7 +100,9 @@ export class SVObject {
                 }
             }
         }
-        
+        if(bestMeta === null) {
+            throw new Error(`No matching metadata found for ${this.namespace}::${this.metaName} with revision <= ${this.revision}`);
+        }
         this.loadDef(bestMeta);
     }
     
@@ -242,17 +244,41 @@ export class SVObject {
                 // Use getInt64() which returns string representation of int64
                 value = sv.getInt64(i);
             } else if (type.value === this.wasmModule.FieldType.IntegerVector.value) {
-                value = sv.getInt32Vector(i);
+                const vector = sv.getInt32Vector(i);
+                value = this.convertVectorToArray(vector);
             } else if (type.value === this.wasmModule.FieldType.DoubleVector.value) {
-                value = sv.getDoubleVector(i);
+                const vector = sv.getDoubleVector(i);
+                value = this.convertVectorToArray(vector);
             } else if (type.value === this.wasmModule.FieldType.StringVector.value) {
-                value = sv.getStringVector(i);
+                const vector = sv.getStringVector(i);
+                value = this.convertVectorToArray(vector);
             } else if (type.value === this.wasmModule.FieldType.Integer64Vector.value) {
                 // Use getInt64Vector() which returns vector<string> representation of vector<int64>
-                value = sv.getInt64Vector(i);
+                const vector = sv.getInt64Vector(i);
+                value = this.convertVectorToArray(vector);
             }
             this.setSvAttr(name, value);
         }
+    }
+    
+    /**
+     * Convert WASM Vector to JavaScript Array
+     * @param {Object} vector - WASM Vector object (StringVector, Int32Vector, etc.)
+     * @returns {Array} - JavaScript array
+     */
+    convertVectorToArray(vector) {
+        if (!vector || typeof vector.size !== 'function') {
+            return [];
+        }
+        
+        const array = [];
+        const size = vector.size();
+        
+        for (let i = 0; i < size; i++) {
+            array.push(vector.get(i));
+        }
+        
+        return array;
     }
     
     /**

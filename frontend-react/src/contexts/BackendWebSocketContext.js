@@ -456,6 +456,63 @@ export function BackendWebSocketProvider({ children }) {
         });
         break;
         
+      case 'historical_data_response':
+        console.log('📈 Historical data response received:', message.success ? 'Success' : 'Failed');
+        if (message.success && message.data) {
+          // Store historical data in DataContext
+          const dataKey = `${message.params?.market || 'unknown'}_${message.params?.code || 'unknown'}_${Date.now()}`;
+          dataActions.addHistoricalData(dataKey, {
+            requestId: message.requestId,
+            market: message.params?.market,
+            code: message.params?.code,
+            metaName: message.params?.metaName,
+            namespace: message.params?.namespace,
+            granularity: message.params?.granularity,
+            fieldCount: message.params?.fieldCount || 0,
+            timeRange: message.params?.timeRange,
+            data: message.data.records || [],
+            totalCount: message.data.totalCount || 0,
+            source: message.data.source || 'backend',
+            processingTime: message.data.processingTime,
+            receivedAt: new Date().toISOString()
+          });
+          
+          dataActions.addLog('success', 'Historical data retrieved successfully', {
+            market: message.params?.market,
+            code: message.params?.code,
+            recordCount: message.data.totalCount || 0,
+            fieldCount: message.params?.fieldCount,
+            source: message.data.source
+          });
+          
+          // Dispatch custom event for HistoricalDataQuery component to catch
+          window.dispatchEvent(new CustomEvent('historicalDataReceived', {
+            detail: {
+              success: true,
+              data: message.data.records || [],
+              totalCount: message.data.totalCount || 0,
+              requestId: message.requestId,
+              params: message.params
+            }
+          }));
+        } else {
+          dataActions.addLog('error', 'Historical data query failed', { 
+            error: message.error,
+            market: message.params?.market,
+            code: message.params?.code
+          });
+          
+          // Dispatch error event
+          window.dispatchEvent(new CustomEvent('historicalDataReceived', {
+            detail: {
+              success: false,
+              error: message.error || 'Unknown error',
+              requestId: message.requestId
+            }
+          }));
+        }
+        break;
+        
       case 'error':
         console.error('❌ Backend error:', message.message);
         dispatch({ 
@@ -563,8 +620,19 @@ export function BackendWebSocketProvider({ children }) {
     return loadCredentials();
   }, []);
 
+  const sendMessage = useCallback((message) => {
+    if (!state.isConnected) {
+      console.warn('⚠️ Not connected to backend');
+      return;
+    }
+
+    console.log('📤 Sending message to backend:', message.type);
+    wsRef.current.send(JSON.stringify(message));
+  }, [state.isConnected]);
+
   const value = {
     ...state,
+    sendMessage,
     actions: {
       connectToBackend,
       disconnectFromBackend,

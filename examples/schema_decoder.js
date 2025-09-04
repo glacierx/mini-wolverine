@@ -5,7 +5,7 @@ import ws from 'nodejs-websocket';
 let caitlyn;
 async function loadCaitlynModule() {
     try {
-        const CaitlynModule = await import("../frontend-react/public/caitlyn_js.mjs");
+        const CaitlynModule = await import("../backend/public/caitlyn_js.js");
         caitlyn = await CaitlynModule.default();
         console.log("✅ Caitlyn module loaded successfully!");
         
