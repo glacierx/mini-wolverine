@@ -715,12 +715,16 @@ class WasmService {
     // Create a copy of the content
     const content = new Uint8Array(contentLength);
     content.set(new Uint8Array(contentView));
-    
+    if (pkg.header.cmd !== this.module.NET_CMD_GOLD_ROUTE_KEEPALIVE && 
+        pkg.header.cmd !== this.module.CMD_TA_MARKET_STATUS) {
+      logger.debug(`Decoded message: cmd=${cmd}, raw_len=${arrayBuffer.byteLength}, content_len=${contentLength}`);
+    }
     // NOW we can safely delete the pkg
     pkg.delete();
     
+
     // Log the sizes for debugging
-    logger.debug(`Decoded message: cmd=${cmd}, raw_len=${arrayBuffer.byteLength}, content_len=${contentLength}`);
+    // logger.debug(`Decoded message: cmd=${cmd}, raw_len=${arrayBuffer.byteLength}, content_len=${contentLength}`);
     
     return { cmd, seq, content };
   }

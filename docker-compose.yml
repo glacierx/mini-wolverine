@@ -10,6 +10,8 @@ services:
     environment:
       - PORT=4000
       - LOG_LEVEL=info
+      - CAITLYN_WS_URL=wss://116.wolverine-box.com/tm
+      - CAITLYN_TOKEN=${CAITLYN_TOKEN}
     volumes:
       - ./backend/src:/app/src
       - ./backend/public:/app/public

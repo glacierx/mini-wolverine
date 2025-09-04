@@ -52,6 +52,160 @@ Key = (namespace, meta_name, granularity, market, stock_code, time_tag)
    - Unix timestamp × 1000
    - Example: 1640995200000 = 2022-01-01 00:00:00 UTC
 
+### StructValue Revision System
+
+**CRITICAL**: Each StructValue has a `revision` property in its header that enables schema evolution and versioned field definitions.
+
+#### Revision Architecture
+
+1. **Meta Definitions with Multiple Revisions**
+   - Each meta (data structure type) can have one or many revisions
+   - Each revision can have different field definitions
+   - Meta name remains constant across all revisions within a namespace
+   - System records all revisions received from server schema
+
+```python
+# Example: SampleQuote meta with multiple revisions
+sample_quote_revisions = {
+    0: {  # Original revision - basic OHLC
+        'fields': [('open', pc.data_type_double), ('close', pc.data_type_double), 
+                   ('high', pc.data_type_double), ('low', pc.data_type_double)],
+        'field_count': 4
+    },
+    1: {  # Updated revision - added volume and turnover
+        'fields': [('open', pc.data_type_double), ('close', pc.data_type_double),
+                   ('high', pc.data_type_double), ('low', pc.data_type_double),
+                   ('volume', pc.data_type_int_64), ('turnover', pc.data_type_double)],
+        'field_count': 6
+    }
+}
+```
+
+2. **Revision Properties and Usage**
+   - **StructValue header**: Contains `revision` property indicating data structure version
+   - **Schema storage**: Server schema contains all known revisions for each meta
+   - **sv_object targeting**: Can specify desired revision or use `0xFFFFFFFF` for latest
+   - **Query specification**: All queries and real-time subscriptions must specify revision
+
+```python
+# Accessing StructValue revision
+sv = struct_value_from_server
+print(f"Revision: {sv.get_revision()}")    # e.g., 1
+print(f"MetaID: {sv.get_meta_id()}")       # e.g., 1 (SampleQuote)
+print(f"Namespace: {sv.get_namespace()}")  # e.g., 0 (global)
+
+# sv_object with specific revision
+class MyIndicator(sv_object):
+    def __init__(self):
+        super().__init__()
+        self.revision = 1           # Use specific revision
+        # self.revision = 0xFFFFFFFF  # Use latest available revision
+        self.meta_name = "MyIndicator"
+
+# Query with revision specification
+subscription_req = pc.ATSubscribeReq()
+subscription_req.set_revision(1)        # Must specify revision
+subscription_req.set_namespace(pc.namespace_global)
+subscription_req.set_meta_name(b"SampleQuote")
+subscription_req.set_market(b"SHFE")
+subscription_req.set_stock_code(b"au2412")
+```
+
+3. **Schema Revision Management in Client**
+
+```python
+def _load_index_serializer(self, body: bytes):
+    """Load schema definitions with revision support."""
+    
+    # 1. Load schema
+    schema = pc.IndexSchema()
+    schema.load(body)
+    
+    # 2. Extract metadata with revision support
+    metas: pc.IndexMetaVector = schema.metas()
+    
+    # 3. Organize by namespace, name, and revision
+    self.schema_by_revision = {}  # namespace -> name -> revision -> meta
+    self.schema_by_id = {}        # namespace -> metaID -> meta (latest revision)
+    
+    for meta in metas:
+        _meta: pc.IndexMeta = meta
+        namespace = _meta.get_namespace()
+        meta_id = _meta.get_id()
+        meta_name = _meta.get_name().decode('utf-8').split("::")[-1]
+        revision = _meta.get_revision()
+        
+        # Store by namespace and ID (latest revision wins)
+        if namespace not in self.schema_by_id:
+            self.schema_by_id[namespace] = {}
+        self.schema_by_id[namespace][meta_id] = meta
+        
+        # Store by namespace, name, and revision
+        if namespace not in self.schema_by_revision:
+            self.schema_by_revision[namespace] = {}
+        if meta_name not in self.schema_by_revision[namespace]:
+            self.schema_by_revision[namespace][meta_name] = {}
+        self.schema_by_revision[namespace][meta_name][revision] = meta
+        
+        print(f"Loaded: {meta_name} revision {revision} (ID: {meta_id})")
+
+# Access specific revision
+def get_meta_revision(self, namespace, meta_name, revision):
+    """Get specific revision of a meta."""
+    if revision == 0xFFFFFFFF:
+        # Get latest revision
+        revisions = self.schema_by_revision[namespace][meta_name]
+        latest_revision = max(revisions.keys())
+        return revisions[latest_revision]
+    else:
+        return self.schema_by_revision[namespace][meta_name][revision]
+```
+
+4. **Field Access with Revision Awareness**
+
+```python
+def extract_with_revision(self, sv: pc.StructValue):
+    """Extract data with revision-specific field definitions."""
+    
+    namespace = sv.get_namespace()
+    meta_id = sv.get_meta_id()
+    revision = sv.get_revision()
+    
+    # Get revision-specific metadata
+    if namespace in self.schema_by_id and meta_id in self.schema_by_id[namespace]:
+        meta = self.schema_by_id[namespace][meta_id]
+        meta_name = meta.get_name().decode('utf-8').split("::")[-1]
+        
+        # Get specific revision meta if different from loaded
+        if revision in self.schema_by_revision[namespace][meta_name]:
+            revision_meta = self.schema_by_revision[namespace][meta_name][revision]
+        else:
+            print(f"Warning: Revision {revision} not found for {meta_name}, using latest")
+            revision_meta = meta
+        
+        # Extract fields based on revision-specific definitions
+        fields = revision_meta.get_fields()
+        data = {}
+        
+        for i, field in enumerate(fields):
+            field_name = field.get_name().decode('utf-8')
+            field_type = field.get_type()
+            
+            if field_type == pc.data_type_double:
+                data[field_name] = sv.get_double(i)
+            elif field_type == pc.data_type_int:
+                data[field_name] = sv.get_int(i)
+            elif field_type == pc.data_type_int_64:
+                data[field_name] = sv.get_int_64(i)
+            elif field_type == pc.data_type_string:
+                data[field_name] = sv.get_string(i)
+            # ... handle other types
+        
+        return data
+    
+    raise ValueError(f"Unknown meta: namespace={namespace}, id={meta_id}")
+```
+
 ### Field Type System
 
 StructValue supports a rich type system for financial data:
@@ -87,6 +241,7 @@ class sv_object(object):
         self.namespace: int = pc.namespace_private
         self.meta_id: int = 0
         self.meta_name: str = ''
+        self.revision: int = 0          # CRITICAL: Revision number
         self.market: bytes = b''
         self.code: bytes = b''
         self.timetag: int = None
@@ -144,8 +299,9 @@ def to_sv(self) -> pc.StructValue:
     """Serialize Python object to StructValue."""
     sv = self.sv
     
-    # Set header information
+    # Set header information including revision
     sv.set_meta_id(self.meta_id)
+    sv.set_revision(self.revision)      # CRITICAL: Include revision in header
     sv.set_market(self.market)
     sv.set_stock_code(self.code)
     sv.set_granularity(self.granularity)
@@ -182,7 +338,7 @@ def to_sv(self) -> pc.StructValue:
 def from_sv(self, sv: pc.StructValue):
     """Deserialize StructValue to Python object."""
     
-    # Validate compatibility
+    # Validate compatibility including revision
     if (self.meta_id != sv.get_meta_id() or
         self.market != sv.get_market() or
         self.code != sv.get_stock_code() or
@@ -190,7 +346,8 @@ def from_sv(self, sv: pc.StructValue):
         self.granularity != sv.get_granularity()):
         raise Exception("Incompatible struct value")
     
-    # Extract timestamp
+    # Extract revision and timestamp
+    self.revision = sv.get_revision()   # CRITICAL: Extract revision from header
     self.timetag = sv.get_time_tag()
     
     # Extract field values by type
@@ -1126,11 +1283,23 @@ async def subscribe_to_data(conn):
     req = pc.ATSubscribeReq()
     req.set_namespace(pc.namespace_global)
     req.set_meta_id(1)  # SampleQuote
+    req.set_revision(1) # CRITICAL: Must specify revision for subscription
     req.set_market(b"SHFE")
     req.set_stock_code(b"au2412")
     req.set_granularity(900)  # 15-minute
     
     conn.send_req(pc.cmd_at_subscribe, req)
+    
+    # Or subscribe to latest revision
+    req_latest = pc.ATSubscribeReq()
+    req_latest.set_namespace(pc.namespace_global)
+    req_latest.set_meta_id(1)
+    req_latest.set_revision(0xFFFFFFFF)  # Latest available revision
+    req_latest.set_market(b"SHFE")
+    req_latest.set_stock_code(b"ag2412")
+    req_latest.set_granularity(300)
+    
+    conn.send_req(pc.cmd_at_subscribe, req_latest)
 
 async def process_events(conn, event_queue):
     """Process incoming events and data."""

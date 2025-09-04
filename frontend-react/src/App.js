@@ -1,29 +1,35 @@
 import React, { useState, useEffect } from 'react';
 import styled from 'styled-components';
-import Header from './components/Header';
 import ConnectionControls from './components/ConnectionControls';
-import StatusSection from './components/StatusSection';
 import TabSection from './components/TabSection';
-import ActionsSection from './components/ActionsSection';
-import Footer from './components/Footer';
 import { BackendWebSocketProvider } from './contexts/BackendWebSocketContext';
 import { DataProvider } from './contexts/DataContext';
 import './App.css';
 
 const Container = styled.div`
-  max-width: 1400px;
+  max-width: 1200px;
   margin: 0 auto;
   padding: 20px;
   min-height: 100vh;
-  display: flex;
-  flex-direction: column;
+  background: #f8f9fa;
 `;
 
-const MainContent = styled.main`
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 30px;
+const Header = styled.header`
+  margin-bottom: 24px;
+  text-align: center;
+`;
+
+const Title = styled.h1`
+  margin: 0 0 8px 0;
+  color: #212529;
+  font-size: 24px;
+  font-weight: 700;
+`;
+
+const Subtitle = styled.p`
+  margin: 0;
+  color: #6c757d;
+  font-size: 14px;
 `;
 
 function App() {
@@ -120,14 +126,13 @@ function App() {
     <DataProvider>
       <BackendWebSocketProvider>
         <Container>
-          <Header />
-          <MainContent>
-            <ConnectionControls />
-            <StatusSection />
-            <TabSection />
-            <ActionsSection />
-          </MainContent>
-          <Footer />
+          <Header>
+            <Title>Mini Wolverine</Title>
+            <Subtitle>Financial Data Processing Platform with Schema & Revision Management</Subtitle>
+          </Header>
+          
+          <ConnectionControls />
+          <TabSection />
         </Container>
       </BackendWebSocketProvider>
     </DataProvider>

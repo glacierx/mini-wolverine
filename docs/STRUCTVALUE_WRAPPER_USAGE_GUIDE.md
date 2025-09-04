@@ -37,6 +37,7 @@ quote.market = 'SHFE';
 quote.code = 'au2412';
 quote.granularity = 900; // 15-minute bars
 quote.timetag = Date.now();
+quote.revision = 1;      // CRITICAL: Specify revision
 
 console.log(`Quote: ${quote.market}/${quote.code} @ ${quote.close}`);
 console.log(`Change: ${(quote.changePercent() * 100).toFixed(2)}%`);
@@ -87,6 +88,112 @@ newQuote.fromSv(structValue);
 
 console.log(`Restored quote: ${newQuote.market}/${newQuote.code}`);
 console.log(`Price: ${newQuote.close}, Volume: ${newQuote.volume}`);
+```
+
+## Revision System Support
+
+### Understanding StructValue Revisions
+
+Each StructValue has a revision number in its header that enables schema evolution. The same meta (data type) can have multiple revisions with different field definitions.
+
+```javascript
+// Working with revisions
+const quote = new SampleQuote(wasmModule);
+quote.revision = 1;          // Use specific revision
+// quote.revision = 0xFFFFFFFF; // Use latest available revision
+
+// Check revision compatibility
+const structValue = quote.toSv();
+console.log(`Created StructValue with revision: ${structValue.revision}`);
+
+// When deserializing, revision is automatically extracted
+const newQuote = new SampleQuote(wasmModule);
+newQuote.fromSv(structValue);
+console.log(`Restored quote with revision: ${newQuote.revision}`);
+```
+
+### Schema Revision Management
+
+```javascript
+// Example: Handle different revisions of the same indicator
+class VersionAwareIndicator extends SVObject {
+    constructor(wasmModule, preferredRevision = 0xFFFFFFFF) {
+        super(wasmModule);
+        this.metaName = "MyIndicator";
+        this.revision = preferredRevision;  // Latest by default
+        
+        // Fields may vary by revision
+        if (this.revision === 0) {
+            // Original revision - basic fields
+            this.signal = 0;
+            this.confidence = 0.0;
+        } else if (this.revision === 1) {
+            // Updated revision - additional fields
+            this.signal = 0;
+            this.confidence = 0.0;
+            this.strength = 0.0;      // New field in revision 1
+            this.volatility = 0.0;    // New field in revision 1
+        }
+    }
+    
+    initializeFields() {
+        if (this.revision === 0) {
+            this.fields = [
+                ['signal', DataType.INT],
+                ['confidence', DataType.DOUBLE]
+            ];
+        } else {
+            this.fields = [
+                ['signal', DataType.INT],
+                ['confidence', DataType.DOUBLE],
+                ['strength', DataType.DOUBLE],
+                ['volatility', DataType.DOUBLE]
+            ];
+        }
+    }
+}
+
+// Usage with different revisions
+const indicatorV0 = new VersionAwareIndicator(wasmModule, 0);  // Original version
+const indicatorV1 = new VersionAwareIndicator(wasmModule, 1);  // Updated version
+const indicatorLatest = new VersionAwareIndicator(wasmModule); // Latest available
+```
+
+### Query and Subscription with Revisions
+
+```javascript
+// When making queries, always specify revision
+class DataRequester {
+    constructor(wasmModule, webSocket) {
+        this.wasmModule = wasmModule;
+        this.webSocket = webSocket;
+    }
+    
+    subscribeToData(market, symbol, revision = 1) {
+        const subscriptionRequest = {
+            type: 'subscribe',
+            namespace: 0,        // global
+            metaName: 'SampleQuote',
+            revision: revision,  // CRITICAL: Must specify revision
+            market: market,
+            stockCode: symbol,
+            granularity: 900
+        };
+        
+        this.webSocket.send(JSON.stringify(subscriptionRequest));
+        console.log(`Subscribed to ${market}/${symbol} revision ${revision}`);
+    }
+    
+    requestLatestData(market, symbol) {
+        // Request with latest revision
+        this.subscribeToData(market, symbol, 0xFFFFFFFF);
+    }
+    
+    requestSpecificRevision(market, symbol, revision) {
+        // Request with specific revision
+        this.subscribeToData(market, symbol, revision);
+    }
+}
 ```
 
 ## Advanced Usage

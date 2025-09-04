@@ -4,6 +4,7 @@ import React, { createContext, useContext, useReducer, useCallback } from 'react
 const initialState = {
   schema: {},
   marketData: {},
+  securities: {},
   historicalData: new Map(),
   logs: [],
   rawMessages: [],
@@ -17,6 +18,7 @@ const initialState = {
 const DATA_ACTIONS = {
   SET_SCHEMA: 'SET_SCHEMA',
   SET_MARKET_DATA: 'SET_MARKET_DATA',
+  SET_SECURITIES: 'SET_SECURITIES',
   ADD_HISTORICAL_DATA: 'ADD_HISTORICAL_DATA',
   CLEAR_HISTORICAL_DATA: 'CLEAR_HISTORICAL_DATA',
   ADD_LOG: 'ADD_LOG',
@@ -46,6 +48,13 @@ function dataReducer(state, action) {
             return nsTotal + (Array.isArray(records) ? records.length : 0);
           }, 0) : 0);
         }, 0)
+      };
+      
+    case DATA_ACTIONS.SET_SECURITIES:
+      const securitiesPayload = action.payload || {};
+      return {
+        ...state,
+        securities: securitiesPayload
       };
 
     case DATA_ACTIONS.ADD_HISTORICAL_DATA:
@@ -114,6 +123,10 @@ export function DataProvider({ children }) {
 
   const setMarketData = useCallback((data) => {
     dispatch({ type: DATA_ACTIONS.SET_MARKET_DATA, payload: data });
+  }, []);
+
+  const setSecurities = useCallback((data) => {
+    dispatch({ type: DATA_ACTIONS.SET_SECURITIES, payload: data });
   }, []);
 
   const addHistoricalData = useCallback((key, data) => {
@@ -233,6 +246,7 @@ export function DataProvider({ children }) {
     actions: {
       setSchema,
       setMarketData,
+      setSecurities,
       addHistoricalData,
       clearHistoricalData,
       addLog,

@@ -15,6 +15,12 @@ const initialState = {
   assignedConnectionId: null,
   cachedSeeds: new Map(),
   lastSeedTimestamp: 0,
+  poolReady: false,
+  poolStats: {
+    totalConnections: 0,
+    availableConnections: 0,
+    busyConnections: 0
+  },
   stats: {
     messagesSent: 0,
     messagesReceived: 0,
@@ -39,7 +45,9 @@ const WS_ACTIONS = {
   SET_CREDENTIALS: 'SET_CREDENTIALS',
   SET_CLIENT_INFO: 'SET_CLIENT_INFO',
   UPDATE_CACHED_SEEDS: 'UPDATE_CACHED_SEEDS',
-  BATCH_UPDATE_CACHED_SEEDS: 'BATCH_UPDATE_CACHED_SEEDS'
+  BATCH_UPDATE_CACHED_SEEDS: 'BATCH_UPDATE_CACHED_SEEDS',
+  SET_POOL_READY: 'SET_POOL_READY',
+  UPDATE_POOL_STATS: 'UPDATE_POOL_STATS'
 };
 
 // Reducer
@@ -151,6 +159,19 @@ function webSocketReducer(state, action) {
         }
       };
       
+    case WS_ACTIONS.SET_POOL_READY:
+      return {
+        ...state,
+        poolReady: true,
+        caitlynConnected: true
+      };
+      
+    case WS_ACTIONS.UPDATE_POOL_STATS:
+      return {
+        ...state,
+        poolStats: { ...state.poolStats, ...action.payload }
+      };
+      
     default:
       return state;
   }
@@ -208,36 +229,14 @@ export function BackendWebSocketProvider({ children }) {
         console.log('📤 Requesting client info...');
         ws.send(JSON.stringify({ type: 'get_client_info' }));
         
-        // Check for stored credentials or environment variables
-        const storedCredentials = loadCredentials();
-        const caitlynUrl = storedCredentials.url || process.env.REACT_APP_WS_URL;
-        const caitlynToken = storedCredentials.token || process.env.REACT_APP_WS_TOKEN;
+        console.log('ℹ️ Backend pre-initialized with Caitlyn connection - no reconfiguration needed');
         
-        if (caitlynUrl && caitlynToken) {
-          console.log('📤 Connecting to Caitlyn server to get schema and data...');
-          ws.send(JSON.stringify({ 
-            type: 'connect',
-            url: caitlynUrl,
-            token: caitlynToken
-          }));
-        } else {
-          console.log('⚠️ No Caitlyn server credentials configured. Please set URL and token in the UI.');
-        }
-        
-        // After connection, request schema and data
+        // After connection, the enhanced pool will automatically initialize
+        // and send pool_ready event with all data
         setTimeout(() => {
-          console.log('📤 Requesting schema...');
-          ws.send(JSON.stringify({ type: 'get_schema' }));
-          
-          console.log('📤 Requesting universe revision (markets)...');
-          ws.send(JSON.stringify({ type: 'test_universe_revision' }));
-          
-          console.log('📤 Querying cached seeds...');
-          ws.send(JSON.stringify({ 
-            type: 'query_cached_seeds', 
-            sinceTimestamp: state.lastSeedTimestamp 
-          }));
-        }, 2000); // Wait 2 seconds for Caitlyn connection to establish
+          console.log('📤 Requesting client info and pool status...');
+          ws.send(JSON.stringify({ type: 'get_pool_stats' }));
+        }, 1000); // Wait 1 second for pool initialization
       }, 500);
       
       dispatch({ 
@@ -290,7 +289,7 @@ export function BackendWebSocketProvider({ children }) {
       };
   }, []); // Remove state dependencies to prevent connection recreation
 
-  // Auto-connect to backend WebSocket on mount (no dependencies to prevent loops)
+  // Auto-connect to backend WebSocket on mount and handle cleanup
   useEffect(() => {
     // Prevent multiple auto-connection attempts
     if (hasAutoConnected.current) {
@@ -306,20 +305,16 @@ export function BackendWebSocketProvider({ children }) {
       connectToBackend();
     }, 100);
     
-    // Cleanup timeout if component unmounts
-    return () => clearTimeout(timeoutId);
-  }, []); // Empty dependency array prevents re-runs
-
-  // Cleanup WebSocket connection on component unmount
-  useEffect(() => {
+    // Cleanup function: close WebSocket and clear timeout
     return () => {
       console.log('🧹 BackendWebSocketContext cleanup - closing WebSocket...');
-      if (wsRef.current) {
+      clearTimeout(timeoutId);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.close(1000, 'Component unmounting');
         wsRef.current = null;
       }
     };
-  }, []);
+  }, []); // Empty dependency array prevents re-runs
 
   const handleBackendMessage = useCallback((message) => {
     // Add all messages to raw messages log
@@ -375,6 +370,44 @@ export function BackendWebSocketProvider({ children }) {
         }
         break;
         
+      case 'pool_ready':
+        console.log('🎆 Enhanced connection pool ready!');
+        dispatch({ type: WS_ACTIONS.SET_POOL_READY });
+        
+        // Handle all the data from the pool
+        if (message.schema) {
+          console.log('📋 Schema received from pool');
+          dataActions.setSchema(message.schema);
+          dataActions.addLog('success', 'Schema definitions loaded from pool', { 
+            definitionsCount: Object.keys(message.schema).reduce((sum, ns) => sum + Object.keys(message.schema[ns] || {}).length, 0)
+          });
+        }
+        
+        if (message.markets) {
+          console.log('🌍 Markets data received from pool');
+          dataActions.setMarketData(message.markets);
+          const globalCount = Object.keys(message.markets?.global || {}).length;
+          const privateCount = Object.keys(message.markets?.private || {}).length;
+          dataActions.addLog('success', 'Market data loaded from pool', { 
+            globalMarkets: globalCount, 
+            privateMarkets: privateCount 
+          });
+        }
+        
+        if (message.securities) {
+          console.log('🗺️ Securities data received from pool');
+          dataActions.setSecurities(message.securities);
+          const marketsCount = Object.keys(message.securities).length;
+          const totalSecurities = Object.values(message.securities).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
+          dataActions.addLog('success', 'Securities data loaded from pool', {
+            marketsWithSecurities: marketsCount,
+            totalSecurities: totalSecurities
+          });
+        }
+        
+        dataActions.addLog('success', 'Enhanced connection pool fully initialized and ready');
+        break;
+        
       case 'handshake_success':
         console.log('✅ Caitlyn handshake successful');
         dataActions.addLog('success', 'Caitlyn handshake completed successfully');
@@ -391,11 +424,25 @@ export function BackendWebSocketProvider({ children }) {
         
       case 'schema_received':
       case 'schema':
-        console.log('📋 Schema received from backend');
+        console.log('📋 Schema received from backend with revision support');
         const schemaData = message.data || message.schema;
+        
+        // Log revision information if available
+        let totalRevisions = 0;
+        if (schemaData) {
+          Object.values(schemaData).forEach(namespace => {
+            Object.values(namespace).forEach(meta => {
+              if (meta.revision !== undefined) {
+                totalRevisions++;
+              }
+            });
+          });
+        }
+        
         dataActions.setSchema(schemaData);
-        dataActions.addLog('success', 'Schema definitions loaded from server', { 
-          definitionsCount: Object.keys(schemaData || {}).length 
+        dataActions.addLog('success', 'Schema definitions with revisions loaded', { 
+          definitionsCount: Object.keys(schemaData || {}).length,
+          totalRevisions: totalRevisions
         });
         break;
         
@@ -513,6 +560,38 @@ export function BackendWebSocketProvider({ children }) {
         }
         break;
         
+      case 'connection_error':
+        console.error('❌ Pool connection error:', message.connectionId, message.error);
+        dataActions.addLog('error', 'Connection pool error', { 
+          connectionId: message.connectionId,
+          error: message.error 
+        });
+        break;
+        
+      case 'pool_shutdown':
+        console.log('📋 Connection pool shutdown');
+        dispatch({ type: WS_ACTIONS.SET_CAITLYN_DISCONNECTED });
+        dataActions.addLog('warning', 'Connection pool has been shut down');
+        break;
+        
+      case 'securities_data':
+        console.log('🗺️ Securities data received from backend');
+        if (message.data) {
+          dataActions.setSecurities(message.data);
+          const marketsCount = Object.keys(message.data).length;
+          const totalSecurities = Object.values(message.data).reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
+          dataActions.addLog('success', 'Securities data loaded', {
+            marketsWithSecurities: marketsCount,
+            totalSecurities: totalSecurities
+          });
+        }
+        break;
+        
+      case 'securities_not_ready':
+        console.log('⚠️ Securities data not yet ready');
+        dataActions.addLog('info', 'Securities data not yet available - pool initializing');
+        break;
+        
       case 'error':
         console.error('❌ Backend error:', message.message);
         dispatch({ 
@@ -589,11 +668,18 @@ export function BackendWebSocketProvider({ children }) {
       return;
     }
 
-    console.log('📊 Requesting historical data via backend');
+    console.log('📊 Requesting historical data via backend with revision:', params.revision);
+    
+    // Ensure revision is included in the request
+    const enhancedParams = {
+      ...params,
+      revision: params.revision || 0xFFFFFFFF, // Default to latest revision if not specified
+      requestId: Date.now() // Add request ID for tracking
+    };
     
     const message = {
       type: 'request_historical',
-      params: params
+      params: enhancedParams
     };
     
     wsRef.current.send(JSON.stringify(message));

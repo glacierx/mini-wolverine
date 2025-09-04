@@ -30,21 +30,21 @@ Mini Wolverine is a modern full-stack financial data processing application with
 ```
 Backend-Frontend Architecture:
 ┌─────────────────────────────────────────────────────────────┐
-│ React Frontend (Port 3000)                                 │
-│ ├── Pure React UI components                               │
-│ ├── BackendWebSocketContext (connects to backend)         │
-│ ├── DataContext (receives processed data from backend)    │
-│ └── No WASM dependencies                                   │
+│ React Frontend (Port 3000)                                  │
+│ ├── Pure React UI components                                │
+│ ├── BackendWebSocketContext (connects to backend)           │
+│ ├── DataContext (receives processed data from backend)      │
+│ └── No WASM dependencies                                    │
 └─────────────────────────────────────────────────────────────┘
                               │ WebSocket API
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Node.js Backend (Port 4000)                               │
-│ ├── Express REST API (/api/health, /api/schema)           │
-│ ├── WebSocket Server (frontend connections)               │
-│ ├── WasmService (all WASM operations)                     │
-│ ├── CaitlynWebSocketService (Caitlyn server proxy)        │
-│ └── All caitlyn_js.wasm processing                        │
+│ Node.js Backend (Port 4000)                                 │
+│ ├── Express REST API (/api/health, /api/schema)             │
+│ ├── WebSocket Server (frontend connections)                 │
+│ ├── WasmService (all WASM operations)                       │
+│ ├── CaitlynWebSocketService (Caitlyn server proxy)          │
+│ └── All caitlyn_js.wasm processing                          │
 └─────────────────────────────────────────────────────────────┘
                               │ WebSocket/WASM
                               ▼
@@ -363,9 +363,12 @@ try {
 // 1. Create reusable SVObject cache (once per function/scope)
 const svObjectCache = {};
 
-// 2. Create or reuse SVObject instance
+// 2. Create or reuse SVObject instance (generic pattern - most common)
 if (!svObjectCache[qualifiedName]) {
-  svObjectCache[qualifiedName] = createSingularityObject(qualifiedName, wasmModule);
+  svObjectCache[qualifiedName] = new SVObject(wasmModule);
+  svObjectCache[qualifiedName].metaName = qualifiedName;
+  svObjectCache[qualifiedName].namespace = namespace || wasmModule.NAMESPACE_GLOBAL;
+  svObjectCache[qualifiedName].revision = revision || 0xFFFFFFFF;  // Use latest revision by default
   svObjectCache[qualifiedName].loadDefFromDict(schemaByNamespace);  // Load schema once
 }
 
@@ -388,7 +391,7 @@ for (const metaName in svObjectCache) {
 1. **Import Required Classes:**
 
    ```javascript
-   import { createSingularityObject } from '../utils/SingularityObjects.js';
+   import SVObject from '../utils/StructValueWrapper.js';
    ```
 
 2. **Schema Availability Check:**
@@ -403,7 +406,9 @@ for (const metaName in svObjectCache) {
 3. **SVObject Creation and Schema Loading:**
 
    ```javascript
-   const svObject = createSingularityObject(qualifiedName, wasmModule);
+   const svObject = new SVObject(wasmModule);
+   svObject.metaName = qualifiedName;
+   svObject.namespace = namespace || wasmModule.NAMESPACE_GLOBAL;
    svObject.loadDefFromDict(schemaByNamespace);  // Schema-driven field definitions
    ```
 
@@ -420,8 +425,9 @@ for (const metaName in svObjectCache) {
    svObject.cleanup();  // Always cleanup - prevents memory leaks
    ```
 
-**📋 Available Singularity SVObject Types:**
+**📋 Special Case - Available Singularity SVObject Types:**
 
+Use `createSingularityObject()` only for these predefined Singularity types:
 - `MarketData` (global::Market, private::Market)
 - `HolidayData` (global::Holiday, private::Holiday)
 - `SecurityData` (global::Security, private::Security)
@@ -429,6 +435,8 @@ for (const metaName in svObjectCache) {
 - `FutureData` (global::Future, private::Future)
 - `StockData` (global::Stock, private::Stock)
 - `DividendData` (global::Dividend, private::Dividend)
+
+For all other types (SampleQuote, custom queries, etc.), use generic SVObject pattern.
 
 **❌ FORBIDDEN Direct StructValue Patterns:**
 
@@ -442,7 +450,17 @@ if (!sv.isEmpty(1)) { ... }         // ❌ Manual field checking
 **✅ CORRECT SVObject Patterns:**
 
 ```javascript
-// Always do this:
+// Primary pattern - Generic SVObject (most common):
+const svObject = new SVObject(wasmModule);
+svObject.metaName = qualifiedName;  // e.g., 'SampleQuote', 'Future'
+svObject.namespace = namespace;     // wasmModule.NAMESPACE_GLOBAL or NAMESPACE_PRIVATE
+svObject.loadDefFromDict(schemaByNamespace);
+svObject.fromSv(sv);
+const fields = svObject.toJSON().fields;
+const extractedData = fields;       // ✅ Schema-driven field access
+svObject.cleanup();
+
+// Special case - Singularity types only:
 const marketData = createSingularityObject("global::Market", wasmModule);
 marketData.loadDefFromDict(schemaByNamespace);
 marketData.fromSv(sv);
@@ -647,16 +665,16 @@ The `docs/` folder contains comprehensive technical documentation covering all a
 - **`CAITLYN_WASM_INITIALIZATION.md`** - Detailed initialization procedures and configuration patterns. Critical for proper system startup.
 - **`CAITLYN_GLOBAL_STRUCTURES.md`** - Comprehensive catalog of all discovered data structures, market definitions, and protocol constants. Generated from reverse engineering analysis.
 
+### **Advanced Architecture Patterns**
+
+- **`CAITLYN_CLIENT_CONNECTION_PATTERN.md`** - Comprehensive guide for the CaitlynClientConnection pattern with autonomous connections, resource pooling, and production deployment strategies. The modern approach for scalable Caitlyn applications.
+- **`SVOBJECT_BEST_PRACTICES.md`** - Essential documentation for SVObject and StructValue processing patterns. Mandatory reading for all developers working with Caitlyn binary data structures.
+
 ### **Protocol and WebSocket Documentation**
 
 - **`UNIVERSE_INITIALIZATION.md`** - Complete universe initialization flow documentation with step-by-step protocol analysis. The theoretical foundation for practical implementation.
 - **`WEBSOCKET_DATA_MANIPULATION_GUIDE.md`** - Advanced WebSocket protocol patterns, message handling, and data manipulation techniques.
 - **`WEBSOCKET_FIXES_AND_BEST_PRACTICES.md`** - Critical bug fixes, memory management patterns, and production best practices discovered through development.
-
-### **Migration and Update Guides**
-
-- **`ES6_MODULE_MIGRATION.md`** - Guide for migrating to ES6 modules and modern JavaScript patterns in WASM integration.
-- **`WASM_UPDATE_GUIDE.md`** - Procedures for updating WASM modules and handling version compatibility issues.
 
 ### **Implementation Examples**
 
@@ -672,10 +690,12 @@ The `docs/` folder contains comprehensive technical documentation covering all a
 ### **Documentation Usage Strategy**
 
 1. **Start with** `UNIVERSE_INITIALIZATION.md` for theoretical understanding
-2. **Reference** `CAITLYN_GLOBAL_STRUCTURES.md` for data structure definitions
-3. **Implement using** `test.js` as the practical template
-4. **Debug with** `WEBSOCKET_FIXES_AND_BEST_PRACTICES.md` when issues arise
-5. **Consult** `CAITLYN_JS_API.md` for specific API details
+2. **Reference** `CAITLYN_GLOBAL_STRUCTURES.md` for data structure definitions  
+3. **Architecture** `CAITLYN_CLIENT_CONNECTION_PATTERN.md` for production-ready connection patterns
+4. **Data Processing** `SVOBJECT_BEST_PRACTICES.md` for safe StructValue handling (mandatory)
+5. **Implement using** `test.js` as the practical template
+6. **Debug with** `WEBSOCKET_FIXES_AND_BEST_PRACTICES.md` when issues arise
+7. **Consult** `CAITLYN_JS_API.md` for specific API details
 
 This documentation suite represents the complete knowledge base for Caitlyn WASM integration, from high-level concepts to implementation details.
 

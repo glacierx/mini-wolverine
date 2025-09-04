@@ -66,6 +66,131 @@ Every StructValue is uniquely identified by a 6-dimensional key, accessed throug
    - JavaScript Date.now() compatible format
    - Example: `1640995200000 = 2022-01-01 00:00:00 UTC`
 
+### StructValue Revision System
+
+**CRITICAL**: Each StructValue has a `revision` property in its header that enables schema evolution and field definition changes over time.
+
+#### Revision Architecture
+
+1. **Meta Definitions with Multiple Revisions**
+   - Each meta (data structure type) can have one or many revisions
+   - Each revision can have different field definitions
+   - Meta name remains constant across all revisions within a namespace
+   - System records all revisions received from server schema
+
+```javascript
+// Example: Market meta with multiple revisions
+const marketRevisions = {
+  0: { // Original revision
+    fields: ['trade_day', 'name', 'time_zone'],
+    fieldTypes: [DataType.INT32, DataType.STRING, DataType.STRING]
+  },
+  1: { // Updated revision with additional field
+    fields: ['trade_day', 'name', 'time_zone', 'revs'],
+    fieldTypes: [DataType.INT32, DataType.STRING, DataType.STRING, DataType.STRING]
+  }
+};
+```
+
+2. **Revision Properties and Usage**
+   - **StructValue header**: Contains `revision` property indicating data structure version
+   - **Schema storage**: Server schema contains all known revisions for each meta
+   - **SVObject targeting**: Can specify desired revision or use `0xFFFFFFFF` for latest
+   - **Query specification**: All queries and real-time subscriptions must specify revision
+
+```javascript
+// Accessing StructValue revision
+const sv = structValueFromServer;
+console.log(`Revision: ${sv.revision}`); // e.g., 1
+console.log(`MetaID: ${sv.metaID}`);    // e.g., 3 (Market)
+console.log(`Namespace: ${sv.namespace}`); // e.g., 0 (global)
+
+// SVObject with specific revision
+const svObject = new SVObject(wasmModule);
+svObject.revision = 1;          // Use specific revision
+// svObject.revision = 0xFFFFFFFF; // Use latest available revision
+
+// Query with revision specification
+const query = {
+  namespace: 0,           // global
+  metaName: "Market",
+  revision: 1,            // Must specify revision
+  market: "SHFE",
+  stockCode: "au2412"
+};
+```
+
+3. **Schema Revision Management**
+
+```javascript
+// Schema organized by namespace, meta name, and revision
+const schemaByRevision = {
+  0: { // namespace: global
+    "Market": {
+      0: marketRevision0Meta,  // Original revision
+      1: marketRevision1Meta   // Updated revision
+    },
+    "Security": {
+      0: securityRevision0Meta
+    }
+  },
+  1: { // namespace: private
+    "MyStrategy": {
+      0: strategyRevision0Meta,
+      1: strategyRevision1Meta
+    }
+  }
+};
+
+// Access latest revision
+function getLatestRevision(namespace, metaName) {
+  const revisions = schemaByRevision[namespace][metaName];
+  const latestRevisionNumber = Math.max(...Object.keys(revisions).map(Number));
+  return revisions[latestRevisionNumber];
+}
+
+// Access specific revision
+function getRevision(namespace, metaName, revision) {
+  return schemaByRevision[namespace][metaName][revision];
+}
+```
+
+4. **Field Access with Revision Awareness**
+
+```javascript
+// Schema-based field access with revision support
+function getFieldValue(sv, schemaByRevision, fieldName, dataType) {
+  const namespace = sv.namespace;
+  const metaName = getMetaName(sv.metaID); // Convert metaID to name
+  const revision = sv.revision;
+  
+  // Get revision-specific metadata
+  const revisionMeta = schemaByRevision[namespace][metaName][revision];
+  if (!revisionMeta) {
+    throw new Error(`Unknown revision: ${metaName} revision ${revision}`);
+  }
+  
+  const fieldIndex = revisionMeta.fieldMap[fieldName];
+  if (fieldIndex === undefined) {
+    throw new Error(`Field ${fieldName} not found in ${metaName} revision ${revision}`);
+  }
+  
+  // Extract field value using revision-specific position
+  switch(dataType) {
+    case 'int32': return sv.getInt32(fieldIndex);
+    case 'string': return sv.getString(fieldIndex);
+    case 'double': return sv.getDouble(fieldIndex);
+    default: throw new Error(`Unsupported data type: ${dataType}`);
+  }
+}
+
+// Example: Safe field access with revision handling
+const marketSv = structValueFromServer; // revision = 1
+const tradeDay = getFieldValue(marketSv, schemaByRevision, 'trade_day', 'int32');
+const marketName = getFieldValue(marketSv, schemaByRevision, 'name', 'string');
+const revisions = getFieldValue(marketSv, schemaByRevision, 'revs', 'string'); // Only in revision 1+
+```
+
 ### JavaScript Field Type System
 
 StructValue supports a comprehensive type system accessible through JavaScript methods:
@@ -133,15 +258,31 @@ schema.load(binaryContent);
 const metas = schema.metas();
 const schemaLookup = {};
 
-// Build schema lookup table
+// Build schema lookup table with revision support
+const schemaByNamespace = {}; // By namespace -> metaID -> meta
+const schemaByName = {};      // By namespace -> metaName -> revision -> meta
+
 for (let i = 0; i < metas.size(); i++) {
     const meta = metas.get(i);
+    const namespace = meta.namespace;
+    const metaID = meta.ID;
+    const metaName = meta.name;
+    const revision = meta.revision;
     
-    if (!schemaLookup[meta.namespace]) {
-        schemaLookup[meta.namespace] = {};
+    // Organize by namespace and metaID
+    if (!schemaByNamespace[namespace]) {
+        schemaByNamespace[namespace] = {};
     }
+    schemaByNamespace[namespace][metaID] = meta;
     
-    schemaLookup[meta.namespace][meta.ID] = meta;
+    // Organize by namespace, name, and revision
+    if (!schemaByName[namespace]) {
+        schemaByName[namespace] = {};
+    }
+    if (!schemaByName[namespace][metaName]) {
+        schemaByName[namespace][metaName] = {};
+    }
+    schemaByName[namespace][metaName][revision] = meta;
 }
 
 // Initialize compressor with schema
@@ -597,10 +738,13 @@ class MessageEncoder {
     }
     
     createUniverseSeedsRequest(revision, namespace, qualifiedName, marketCode, tradeDay) {
+        // CRITICAL: revision parameter specifies which schema revision to use
+        // revision = specific revision number (0, 1, 2, ...)
+        // revision = 0xFFFFFFFF for latest available revision
         const seedsReq = new this.wasmModule.ATUniverseSeedsReq(
             this.token,
             this.sequenceId++,
-            revision,
+            revision,  // Must specify revision for query
             namespace,
             qualifiedName,
             marketCode,
@@ -642,9 +786,22 @@ websocket.send(encoder.createKeepaliveMessage());
 // Send universe request  
 websocket.send(encoder.createUniverseRequest());
 
-// Send seeds requests
+// Send seeds requests with revision specification
 websocket.send(encoder.createUniverseSeedsRequest(
-    1, "global", "Commodity", "SHFE", 20240827
+    1,           // revision: specific version
+    "global",    // namespace
+    "Commodity", // qualified name
+    "SHFE",      // market code
+    20240827     // trade day
+));
+
+// Or request latest revision
+websocket.send(encoder.createUniverseSeedsRequest(
+    0xFFFFFFFF,  // revision: latest available
+    "global", 
+    "Commodity", 
+    "SHFE", 
+    20240827
 ));
 ```
 

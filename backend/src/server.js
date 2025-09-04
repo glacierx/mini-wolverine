@@ -6,7 +6,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 
-import WasmService from './services/WasmService.js';
 import CaitlynWebSocketService from './services/CaitlynWebSocketService.js';
 import logger from './utils/logger.js';
 
@@ -25,19 +24,18 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../public')));
 
-// Initialize services with connection pool configuration
-const wasmService = new WasmService();
+// Initialize services with enhanced connection pool configuration
 
-// Connection pool configuration - TESTING: Single connection, no expansion
+// Connection pool configuration - Conservative single connection to avoid WASM abort
 const poolConfig = {
-  poolSize: 1, // Single connection only
-  maxPoolSize: 1, // Disable pool expansion
-  connectionTimeout: parseInt(process.env.CAITLYN_CONNECTION_TIMEOUT) || 30000,
+  poolSize: 1, // Single connection only to avoid WASM conflicts
+  maxPoolSize: 1, // No pool expansion to prevent WASM abort errors
+  connectionTimeout: parseInt(process.env.CAITLYN_CONNECTION_TIMEOUT) || 60000,
   reconnectDelay: parseInt(process.env.CAITLYN_RECONNECT_DELAY) || 5000,
-  maxReconnectAttempts: parseInt(process.env.CAITLYN_MAX_RECONNECT_ATTEMPTS) || 3
+  maxReconnectAttempts: parseInt(process.env.CAITLYN_MAX_RECONNECT_ATTEMPTS) || 2
 };
 
-const caitlynService = new CaitlynWebSocketService(wasmService, poolConfig);
+const caitlynService = new CaitlynWebSocketService(poolConfig);
 
 // Helper function to generate mock historical data on server side
 function generateServerMockData(params) {
@@ -49,15 +47,21 @@ function generateServerMockData(params) {
   let basePrice = 3000 + Math.random() * 200;
   
   // Get schema for proper field definitions
-  const schema = wasmService.getSchema();
+  const schema = caitlynService.getSharedSchema();
   let fieldDefs = [];
   
   if (schema && schema[namespace] && schema[namespace][metaID]) {
     const meta = schema[namespace][metaID];
     fieldDefs = fieldIndices ? fieldIndices.map(idx => meta.fields[idx]).filter(Boolean) : meta.fields || [];
+    
+    // Safety limit: prevent too many fields from being processed
+    if (fieldDefs.length > 20) {
+      logger.warn(`Too many fields (${fieldDefs.length}), limiting to first 20`);
+      fieldDefs = fieldDefs.slice(0, 20);
+    }
   }
   
-  while (currentTime <= endTime && mockRecords.length < 1000) { // Limit for performance
+  while (currentTime <= endTime && mockRecords.length < 100) { // Reduced limit to prevent frontend crash
     const record = {};
     
     // Generate data for each field definition
@@ -127,73 +131,117 @@ function generateServerMockData(params) {
 
 // REST API Routes
 app.get('/api/health', (req, res) => {
+  const poolStats = caitlynService.connectionPool ? caitlynService.connectionPool.getStats() : null;
   res.json({ 
     status: 'healthy',
-    wasm: wasmService.isReady(),
-    poolConfig: poolConfig,
+    pool: poolStats,
+    poolConfig: caitlynService.poolConfig,
     timestamp: new Date().toISOString()
   });
 });
 
 app.get('/api/schema', async (req, res) => {
-  const schema = await wasmService.getSchema();
-  res.json(schema);
+  const schema = caitlynService.getSharedSchema();
+  res.json(schema || {});
 });
 
 app.get('/api/markets', async (req, res) => {
-  const markets = await wasmService.getMarkets();
-  res.json(markets);
+  const markets = caitlynService.getSharedMarkets();
+  res.json(markets || {});
+});
+
+app.get('/api/securities', async (req, res) => {
+  const securities = caitlynService.getSharedSecurities();
+  res.json(securities || {});
 });
 
 // New API endpoints for historical data querying by code
 
 app.get('/api/futures', async (req, res) => {
-  const futures = await wasmService.getFutures();
-  res.json(futures || {});
+  const securities = caitlynService.getSharedSecurities();
+  res.json(securities || {});
 });
 
 app.get('/api/futures/markets', async (req, res) => {
   // Get actual market names from markets data (from universe revision)
-  const marketsData = await wasmService.getMarkets();
+  const marketsData = caitlynService.getSharedMarkets();
   if (marketsData && marketsData.global) {
     // Return array of market names from the global markets data
     const marketNames = Object.keys(marketsData.global);
     res.json(marketNames);
   } else {
     // Fallback to futures index if markets data not available
-    const markets = await wasmService.getMarketsWithFutures();
+    const markets = Object.keys(caitlynService.getSharedMarkets()?.global || {});
     res.json(markets);
   }
 });
 
 app.get('/api/futures/:market', async (req, res) => {
   const { market } = req.params;
-  const futures = await wasmService.getFuturesForMarket(market);
+  const securities = caitlynService.getSharedSecurities();
+  const futures = securities[market] || [];
   res.json(futures);
 });
 
 app.get('/api/futures/search/:pattern', async (req, res) => {
   const { pattern } = req.params;
   const { market } = req.query;
-  const results = await wasmService.searchFutures(pattern, market);
+  const securities = caitlynService.getSharedSecurities();
+  let results = Object.values(securities).flat().filter(f => 
+    f.symbol?.toLowerCase().includes(pattern.toLowerCase()) || 
+    f.name?.toLowerCase().includes(pattern.toLowerCase())
+  );
+  if (market) {
+    results = securities[market]?.filter(f => 
+      f.symbol?.toLowerCase().includes(pattern.toLowerCase()) || 
+      f.name?.toLowerCase().includes(pattern.toLowerCase())
+    ) || [];
+  }
   res.json(results);
 });
 
 // WebSocket connection handling
 wss.on('connection', (ws, req) => {
-  logger.info('New WebSocket connection from frontend');
+  logger.info('New WebSocket connection from frontend - using pre-initialized Caitlyn connection');
   
-  // Create a client handler for this connection
+  // Create a client handler for this connection (uses pre-initialized shared pool)
   const clientHandler = caitlynService.createClientHandler(ws);
   
-  // Auto-connect to Caitlyn server - DISABLED for testing
-  // const autoConnectUrl = process.env.CAITLYN_WS_URL || 'wss://116.wolverine-box.com/tm';
-  // const autoConnectToken = process.env.CAITLYN_TOKEN;
+  // Immediately notify frontend that connection is ready
+  ws.send(JSON.stringify({
+    type: 'connection_status',
+    status: 'connected',
+    message: 'Connected to pre-initialized Caitlyn server'
+  }));
   
-  // setTimeout(async () => {
-  //   logger.info('Auto-connecting frontend to Caitlyn server...');
-  //   await clientHandler.connectToCaitlyn(autoConnectUrl, autoConnectToken, true);
-  // }, 100);
+  // Send schema and markets data immediately if available
+  const schema = caitlynService.getSharedSchema();
+  const markets = caitlynService.getSharedMarkets();
+  const securities = caitlynService.getSharedSecurities();
+  
+  if (schema && Object.keys(schema).length > 0) {
+    ws.send(JSON.stringify({
+      type: 'schema_received',
+      data: schema,
+      message: 'Schema available from pre-initialized backend'
+    }));
+  }
+  
+  if (markets && Object.keys(markets).length > 0) {
+    ws.send(JSON.stringify({
+      type: 'markets_received',
+      data: markets,
+      message: 'Markets data available from pre-initialized backend'
+    }));
+  }
+  
+  if (securities && Object.keys(securities).length > 0) {
+    ws.send(JSON.stringify({
+      type: 'securities_received',
+      data: securities,
+      message: 'Securities data available from pre-initialized backend'
+    }));
+  }
   
   ws.on('message', async (message) => {
     const data = JSON.parse(message);
@@ -201,20 +249,13 @@ wss.on('connection', (ws, req) => {
     
     switch (data.type) {
       case 'connect':
-        // Global connection - any client can change backend's global Caitlyn server configuration
-        // First check if we need to shutdown existing connections
-        if (caitlynService.isPoolInitialized) {
-          // Check if URL or token changed
-          const currentUrl = caitlynService.currentUrl;
-          const currentToken = caitlynService.globalToken;
-          
-          if (currentUrl !== data.url || currentToken !== data.token) {
-            logger.info(`Configuration change detected. Old: ${currentUrl} | New: ${data.url}`);
-            await caitlynService.resetConfiguration();
-          }
-        }
-        
-        await clientHandler.connectToCaitlyn(data.url, data.token, false);
+        // Reconfiguration disabled - backend is pre-initialized
+        logger.info('Frontend reconfiguration request ignored - backend uses pre-configured connection');
+        ws.send(JSON.stringify({
+          type: 'connection_status',
+          status: 'connected',
+          message: 'Using pre-configured Caitlyn connection (reconfiguration disabled)'
+        }));
         break;
         
       case 'query_cached_seeds':
@@ -249,43 +290,60 @@ wss.on('connection', (ws, req) => {
           
           logger.info(`Processing historical data request for ${market}/${code}, namespace: ${namespace}, metaID: ${metaID}`);
           
-          // Create historical data request using WASM API
-          const requestBuffer = wasmService.createHistoricalDataByCodeRequest(
-            caitlynService.globalToken,
-            caitlynService.getNextSequenceId(), // Use proper sequence ID from connection
-            market,
-            code,
-            metaName || 'SampleQuote',
-            namespace || 0,
-            granularity,
-            startTime,
-            endTime,
-            fields
-          );
+          // Historical data requests now handled by connection pool
+          logger.info(`Preparing historical data request for ${market}/${code}`);
           
-          // Send the request to Caitlyn server
+          // Send the request to Caitlyn server and process the response
           logger.info(`Sending historical data request to Caitlyn server: ${market}/${code}`);
           
-          // For now, return structured response with mock data indicating proper processing
-          // In full implementation, this would wait for Caitlyn server response
-          const mockHistoricalData = generateServerMockData(params);
-          
-          ws.send(JSON.stringify({
-            type: 'historical_data_response',
-            success: true,
-            data: mockHistoricalData,
-            requestId: data.requestId || Date.now(),
-            message: `Historical data retrieved for ${market}/${code}`,
-            params: {
-              market,
-              code,
-              metaName,
-              namespace,
-              granularity,
-              fieldCount: fields ? fields.length : 0,
-              timeRange: `${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}`
+          try {
+            // Send the request to the actual Caitlyn server via the connection pool
+            // This should trigger a CMD_AT_FETCH_BY_CODE request
+            const activeConnection = caitlynService.sharedConnectionPool?.getAvailableConnection();
+            
+            if (!activeConnection) {
+              throw new Error('No active connection to Caitlyn server available');
             }
-          }));
+            
+            // Send the binary request to Caitlyn server
+            logger.info(`Sending binary request buffer (${requestBuffer.byteLength} bytes) to Caitlyn server`);
+            activeConnection.send(requestBuffer);
+            
+            // For now, we'll need to handle the response asynchronously
+            // The actual response will come back through the WebSocket message handler
+            // For testing purposes, return a placeholder response
+            ws.send(JSON.stringify({
+              type: 'historical_data_response',
+              success: true,
+              data: {
+                records: [],
+                totalCount: 0,
+                source: 'caitlyn_server_request_sent',
+                processingTime: new Date().toISOString(),
+                note: 'Request sent to Caitlyn server - response handling needs implementation'
+              },
+              requestId: data.requestId || Date.now(),
+              message: `Historical data request sent to Caitlyn server for ${market}/${code}`,
+              params: {
+                market,
+                code,
+                metaName,
+                namespace,
+                granularity,
+                fieldCount: fields ? fields.length : 0,
+                timeRange: `${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}`
+              }
+            }));
+            
+          } catch (realDataError) {
+            logger.error('Error sending request to Caitlyn server:', realDataError);
+            ws.send(JSON.stringify({
+              type: 'historical_data_response',
+              success: false,
+              error: `Failed to send request to Caitlyn server: ${realDataError.message}`,
+              requestId: data.requestId || Date.now()
+            }));
+          }
           
         } catch (error) {
           logger.error('Error processing historical data request:', error);
@@ -312,51 +370,55 @@ wss.on('connection', (ws, req) => {
         const { market, code, metaID, granularity, startTime, endTime, namespace, qualifiedName, fields } = data.params;
         
         // Create historical data request using proper WASM API
-        const requestBuffer = wasmService.createHistoricalDataByCodeRequest(
-          caitlynService.globalToken,
-          caitlynService.getNextSequenceId(), // Use proper sequence ID from connection
-          market,
-          code,
-          qualifiedName || 'SampleQuote',
-          namespace || 0,
-          granularity,
-          startTime,
-          endTime,
-          fields
-        );
-        
-        // This is a simplified response - in a real implementation,
-        // you'd need to send the request to the Caitlyn server and handle the response
-        logger.info(`Historical data request created for ${market}/${code}`);
-        
-        // For demonstration, return a success response
-        // In a real implementation, this would trigger actual WebSocket communication
-        ws.send(JSON.stringify({
-          type: 'historical_query_response',
-          success: true,
-          message: `Historical data request prepared for ${market}/${code}`,
-          requestId: Date.now(),
-          params: {
-            market,
-            code,
-            granularity,
-            timeRange: `${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}`
-          }
-        }));
+        // Use connection pool to fetch historical data
+        try {
+          const result = await caitlynService.fetchHistoricalData(market, code, {
+            namespace: namespace || 0,
+            qualifiedName: qualifiedName || 'SampleQuote',
+            granularity: granularity,
+            startTime: startTime,
+            endTime: endTime,
+            fields: fields
+          });
+          
+          // Send successful response with actual data
+          ws.send(JSON.stringify({
+            type: 'historical_query_response',
+            success: true,
+            message: `Historical data retrieved for ${market}/${code}`,
+            data: result,
+            requestId: Date.now(),
+            params: {
+              market,
+              code,
+              granularity,
+              timeRange: `${new Date(startTime).toISOString()} to ${new Date(endTime).toISOString()}`
+            }
+          }));
+        } catch (error) {
+          logger.error(`Historical data fetch failed for ${market}/${code}:`, error);
+          ws.send(JSON.stringify({
+            type: 'historical_query_response',
+            success: false,
+            error: error.message,
+            params: { market, code }
+          }));
+        }
         break;
         
       case 'get_schema':
-        const schema = wasmService.getSchema();
-        if (!schema) {
+        const schema = caitlynService.getSharedSchema();
+        if (!schema || Object.keys(schema).length === 0) {
           ws.send(JSON.stringify({
             type: 'schema',
             schema: null,
-            error: 'Schema not available. Please connect to Caitlyn server first.'
+            error: 'Schema not yet loaded. Backend may still be initializing universe data.'
           }));
         } else {
           ws.send(JSON.stringify({
-            type: 'schema',
-            schema: schema
+            type: 'schema_received',
+            data: schema,
+            message: 'Schema loaded from pre-initialized backend'
           }));
         }
         break;
@@ -368,7 +430,7 @@ wss.on('connection', (ws, req) => {
           clientId: clientHandler.clientId,
           assignedConnectionId: null, // No longer using assigned connections
           isConnected: clientHandler.isConnected,
-          cachedSeedsCount: caitlynService.globalCachedSeeds.size
+          cachedSeedsCount: caitlynService.globalCachedSeeds?.size || 0
         }));
         break;
         
@@ -425,16 +487,36 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Initialize WASM module on startup
+// Initialize enhanced connection pool on startup
 async function initialize() {
-  logger.info('Initializing WASM module...');
-  await wasmService.initialize();
-  logger.info('WASM module initialized successfully');
+  const caitlynUrl = process.env.CAITLYN_WS_URL || 'wss://116.wolverine-box.com/tm';
+  const caitlynToken = process.env.CAITLYN_TOKEN;
   
-  const PORT = process.env.PORT || 4000;
-  server.listen(PORT, () => {
-    logger.info(`Backend server running on port ${PORT}`);
-  });
+  if (!caitlynToken) {
+    logger.error('CAITLYN_TOKEN environment variable is required');
+    process.exit(1);
+  }
+  
+  logger.info(`🚀 Initializing enhanced connection pool to: ${caitlynUrl}`);
+  
+  try {
+    // Determine WASM paths based on environment
+    const wasmJsPath = path.join(__dirname, '..', 'public', 'caitlyn_js.js');
+    const wasmPath = path.join(__dirname, '..', 'public', 'caitlyn_js.wasm');
+    
+    // Initialize the enhanced connection pool with WASM paths
+    await caitlynService.initializePoolOnce(caitlynUrl, caitlynToken, wasmJsPath, wasmPath);
+    logger.info('✅ Enhanced connection pool initialized successfully');
+    
+    const PORT = process.env.PORT || 4000;
+    server.listen(PORT, () => {
+      logger.info(`✅ Backend server ready on port ${PORT} with enhanced Caitlyn connection pool`);
+    });
+  } catch (error) {
+    logger.error('❌ Failed to initialize enhanced connection pool:', error);
+    process.exit(1);
+  }
 }
+
 
 initialize();

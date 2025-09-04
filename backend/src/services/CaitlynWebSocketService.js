@@ -3,30 +3,28 @@ import logger from '../utils/logger.js';
 import CaitlynConnectionPool from './CaitlynConnectionPool.js';
 
 class CaitlynWebSocketService {
-  constructor(wasmService, poolConfig = {}) {
-    this.wasmService = wasmService;
+  constructor(poolConfig = {}) {
     this.poolConfig = {
       poolSize: poolConfig.poolSize || process.env.CAITLYN_POOL_SIZE || 3,
       maxPoolSize: poolConfig.maxPoolSize || process.env.CAITLYN_MAX_POOL_SIZE || 5,
-      connectionTimeout: poolConfig.connectionTimeout || 30000,
+      connectionTimeout: poolConfig.connectionTimeout || 60000, // Longer for full initialization
       reconnectDelay: poolConfig.reconnectDelay || 5000,
       maxReconnectAttempts: poolConfig.maxReconnectAttempts || 3,
       ...poolConfig
     };
-    logger.info('CaitlynWebSocketService configured with pool settings:', this.poolConfig);
+    logger.info('CaitlynWebSocketService configured with enhanced connection pool:', this.poolConfig);
     
-    // Shared singleton instances
-    this.sharedConnectionPool = null;
+    // Enhanced connection pool with CaitlynClientConnection
+    this.connectionPool = null;
     this.isPoolInitialized = false;
-    this.globalCachedSeeds = new Map();
-    this.universeDataFetched = false;
     this.clients = new Set();
     this.globalToken = null;
     this.currentUrl = null;
     
-    // Sequence ID management for Caitlyn protocol
-    this.sequenceCounter = 1; // Start from 1, increment for each request
-    this.maxSequenceId = 2147483647; // Max 32-bit signed integer
+    // Shared data from pool
+    this.sharedSchema = null;
+    this.sharedMarkets = null;
+    this.sharedSecurities = null;
   }
 
   /**
@@ -46,125 +44,100 @@ class CaitlynWebSocketService {
     return current;
   }
 
-  async initializePoolOnce(url, token) {
+  // Store an already-initialized connection (simple approach)
+  setInitializedConnection(ws, token) {
+    this.globalToken = token;
+    this.currentUrl = ws.url;
+    this.initializedConnection = {
+      ws: ws,
+      isReady: true
+    };
+    this.isPoolInitialized = true;
+    logger.info('✅ Initialized connection stored in service');
+  }
+
+  // Get the initialized connection
+  getInitializedConnection() {
+    return this.initializedConnection;
+  }
+
+  async initializePoolOnce(url, token, wasmJsPath, wasmBinaryPath) {
     if (this.isPoolInitialized) {
-      logger.info('Connection pool already initialized, skipping...');
-      return this.sharedConnectionPool;
+      logger.info('Enhanced connection pool already initialized, skipping...');
+      return this.connectionPool;
     }
 
     if (!url || !token) {
       throw new Error('URL and token are required to initialize connection pool');
     }
 
-    // Store URL and token for universe data requests
+    // Store URL and token
     this.currentUrl = url;
     this.globalToken = token;
 
-    logger.info(`Initializing shared connection pool for the first time to: ${url}`);
+    logger.info(`🚀 Initializing enhanced connection pool to: ${url}`);
+    logger.info(`   WASM paths: ${wasmJsPath}, ${wasmBinaryPath}`);
     
-    this.sharedConnectionPool = new CaitlynConnectionPool(this.wasmService, this.poolConfig);
+    this.connectionPool = new CaitlynConnectionPool(this.poolConfig);
     
-    // Set up shared event handlers
-    this.sharedConnectionPool.on('handshake_complete', async (connection) => {
-      logger.info(`Shared connection ${connection.id} handshake complete`);
-    });
+    // Set up pool event handlers
+    this.setupPoolEventHandlers();
     
-    this.sharedConnectionPool.on('handshake_failed', (connection, error) => {
-      logger.error(`Shared connection ${connection.id} handshake failed:`, error);
-    });
-    
-    this.sharedConnectionPool.on('message', async (connection, decoded, commandName) => {
-      await this.handleSharedPoolMessage(connection, decoded, commandName);
-      if (this.sharedConnectionPool) {
-        this.sharedConnectionPool.releaseConnection(connection);
-      }
-    });
-    
-    // Initialize the pool
-    await this.sharedConnectionPool.initialize(url, token);
+    // Initialize the pool with WASM paths
+    await this.connectionPool.initialize(url, token, wasmJsPath, wasmBinaryPath);
     this.isPoolInitialized = true;
     
-    logger.info('Shared connection pool initialized successfully');
-    return this.sharedConnectionPool;
+    logger.info('✅ Enhanced connection pool initialized successfully');
+    return this.connectionPool;
   }
 
-  async handleSharedPoolMessage(connection, decoded, commandName) {
-    // Handle messages at service level and broadcast to all clients
-    if (decoded.cmd !== this.wasmService.getModule().NET_CMD_GOLD_ROUTE_KEEPALIVE && 
-        decoded.cmd !== 20513) {
-      logger.debug(`Shared connection ${connection.id} - ${commandName} (${decoded.cmd})`);
-    }
+  /**
+   * Set up event handlers for the connection pool
+   */
+  setupPoolEventHandlers() {
+    this.connectionPool.on('pool_ready', (data) => {
+      logger.info(`🎆 Pool ready with ${data.totalConnections} connections`);
+      
+      // Store shared data from pool
+      this.sharedSchema = data.schema;
+      this.sharedMarkets = data.markets;
+      this.sharedSecurities = data.securities;
+      
+      // Broadcast to all clients
+      this.broadcastToAllClients({
+        type: 'pool_ready',
+        schema: this.sharedSchema,
+        markets: this.sharedMarkets,
+        securities: this.sharedSecurities
+      });
+    });
     
-    switch (decoded.cmd) {
-      case this.wasmService.getModule().NET_CMD_GOLD_ROUTE_KEEPALIVE:
-      case 20513:
-        break;
-        
-      case this.wasmService.getModule().NET_CMD_GOLD_ROUTE_DATADEF:
-        logger.info(`Shared connection ${connection.id} - Schema received from server`);
-        const schema = this.wasmService.processSchema(decoded.content);
-        
-        this.broadcastToAllClients({
-          type: 'schema_received',
-          data: schema
-        });
-        
-        // Request universe data only once
-        if (!this.universeDataFetched) {
-          this.requestUniverseData();
-        }
-        break;
-        
-      case this.wasmService.getModule().CMD_AT_UNIVERSE_REV:
-        logger.info(`Shared connection ${connection.id} - Universe revision received`);
-        const markets = this.wasmService.processUniverseRevision(decoded.content);
-        
-        this.broadcastToAllClients({
-          type: 'markets_received',
-          data: markets
-        });
-        
-        // Request universe seeds only once
-        if (!this.universeDataFetched) {
-          this.requestUniverseSeeds(markets);
-          this.universeDataFetched = true;
-        }
-        break;
-        
-      case this.wasmService.getModule().CMD_AT_UNIVERSE_SEEDS:
-        logger.debug(`Shared connection ${connection.id} - Universe seeds received`);
-        const seedInfo = this.wasmService.processUniverseSeeds(decoded.content);
-        
-        // Cache the seeds data globally
-        const seedKey = `${decoded.seq}`;
-        this.globalCachedSeeds.set(seedKey, {
-          data: seedInfo,
-          timestamp: Date.now(),
-          seq: decoded.seq
-        });
-        
-        this.broadcastToAllClients({
-          type: 'seeds_received',
-          data: seedInfo,
-          cached: true,
-          cacheKey: seedKey,
-          timestamp: Date.now()
-        });
-        break;
-        
-      case this.wasmService.getModule().CMD_TA_PUSH_DATA:
-        logger.debug(`Shared connection ${connection.id} - Real-time market data received`);
-        this.broadcastToAllClients({
-          type: 'market_data',
-          cmd: decoded.cmd,
-          seq: decoded.seq
-        });
-        break;
-        
-      default:
-        logger.debug(`Shared connection ${connection.id} - Unhandled command: ${commandName}`);
-    }
+    this.connectionPool.on('historical_data_received', (connectionId, data) => {
+      logger.debug(`📊 Historical data received from connection ${connectionId}`);
+      this.broadcastToAllClients({
+        type: 'historical_data',
+        data: data,
+        connectionId: connectionId
+      });
+    });
+    
+    this.connectionPool.on('connection_error', (connectionId, error) => {
+      logger.error(`❌ Connection ${connectionId} error:`, error);
+      this.broadcastToAllClients({
+        type: 'connection_error',
+        connectionId: connectionId,
+        error: error.message
+      });
+    });
+    
+    this.connectionPool.on('pool_shutdown', () => {
+      logger.info('📋 Pool shutdown event received');
+      this.broadcastToAllClients({
+        type: 'pool_shutdown'
+      });
+    });
   }
+
 
   broadcastToAllClients(message) {
     for (const client of this.clients) {
@@ -172,72 +145,59 @@ class CaitlynWebSocketService {
     }
   }
 
-  async requestUniverseData() {
-    if (!this.sharedConnectionPool) {
-      logger.warn('Cannot request universe data - shared pool not initialized');
-      return;
+  /**
+   * Execute historical data fetch using the pool
+   */
+  async fetchHistoricalData(market, code, options = {}) {
+    if (!this.connectionPool) {
+      throw new Error('Connection pool not initialized');
     }
     
-    const request = this.wasmService.createUniverseRequest(this.globalToken);
-    const connection = await this.sharedConnectionPool.sendMessage(request);
-    logger.info(`Universe revision request sent via shared connection ${connection.id}`);
+    try {
+      const result = await this.connectionPool.executeFetchByCode(market, code, options);
+      logger.info(`✅ Historical data fetch completed for ${market}/${code}`);
+      return result;
+    } catch (error) {
+      logger.error(`❌ Historical data fetch failed for ${market}/${code}:`, error);
+      throw error;
+    }
   }
 
-  async requestUniverseSeeds(marketsData) {
-    if (!this.sharedConnectionPool) {
-      logger.warn('Cannot request universe seeds - shared pool not initialized');
-      return;
+  /**
+   * Execute fetch by time range using the pool
+   */
+  async fetchByTimeRange(market, code, options = {}) {
+    if (!this.connectionPool) {
+      throw new Error('Connection pool not initialized');
     }
     
-    logger.info('Sending universe seeds requests using shared connection pool');
-    const allRequests = [];
-    let sequenceId = 3;
-    
-    for (const namespaceStr in marketsData) {
-      const namespaceData = marketsData[namespaceStr];
-      for (const marketCode in namespaceData) {
-        const marketInfo = namespaceData[marketCode];
-        const qualifiedNamesRevisions = marketInfo.revisions;
-        const tradeDay = marketInfo.trade_day;
-        
-        for (const qualifiedName in qualifiedNamesRevisions) {
-          const revision = qualifiedNamesRevisions[qualifiedName];
-          allRequests.push({
-            sequenceId: sequenceId++,
-            revision,
-            namespaceStr,
-            qualifiedName,
-            marketCode,
-            tradeDay
-          });
-        }
-      }
+    try {
+      const result = await this.connectionPool.executeFetchByTimeRange(market, code, options);
+      logger.info(`✅ Time range fetch completed for ${market}/${code}`);
+      return result;
+    } catch (error) {
+      logger.error(`❌ Time range fetch failed for ${market}/${code}:`, error);
+      throw error;
     }
-    
-    logger.info(`Sending ${allRequests.length} universe seeds requests using shared pool`);
-    
-    const requestPromises = allRequests.map(async (reqData) => {
-      const request = this.wasmService.createUniverseSeedsRequest(
-        this.globalToken, // use global token
-        reqData.sequenceId,
-        reqData.revision,
-        reqData.namespaceStr,
-        reqData.qualifiedName,
-        reqData.marketCode,
-        reqData.tradeDay
-      );
-      
-      const connection = await this.sharedConnectionPool.sendMessage(request);
-      return { success: true, connection: connection.id };
-    });
-    
-    const results = await Promise.allSettled(requestPromises);
-    const successful = results.filter(r => r.status === 'fulfilled' && r.value?.success).length;
-    logger.info(`Universe seeds requests completed: ${successful} successful`);
+  }
+
+  /**
+   * Get shared data from pool
+   */
+  getSharedSchema() {
+    return this.sharedSchema || this.connectionPool?.getSharedSchema();
+  }
+
+  getSharedMarkets() {
+    return this.sharedMarkets || this.connectionPool?.getSharedMarkets();
+  }
+
+  getSharedSecurities() {
+    return this.sharedSecurities || this.connectionPool?.getSharedSecurities();
   }
 
   createClientHandler(frontendWs) {
-    const client = new ClientHandler(frontendWs, this.wasmService, this.poolConfig, this);
+    const client = new ClientHandler(frontendWs, this.poolConfig, this);
     this.clients.add(client);
     return client;
   }
@@ -247,27 +207,29 @@ class CaitlynWebSocketService {
   }
 
   async resetConfiguration() {
-    logger.info('Resetting global configuration...');
+    logger.info('Resetting enhanced pool configuration...');
     
-    if (this.sharedConnectionPool) {
-      await this.sharedConnectionPool.shutdown();
+    if (this.connectionPool) {
+      await this.connectionPool.shutdown();
     }
     
-    this.sharedConnectionPool = null;
+    this.connectionPool = null;
     this.isPoolInitialized = false;
-    this.globalCachedSeeds.clear();
-    this.universeDataFetched = false;
     this.currentUrl = null;
     this.globalToken = null;
     
-    logger.info('Global configuration reset complete');
+    // Clear shared data
+    this.sharedSchema = null;
+    this.sharedMarkets = null;
+    this.sharedSecurities = null;
+    
+    logger.info('Enhanced pool configuration reset complete');
   }
 }
 
 class ClientHandler {
-  constructor(frontendWs, wasmService, poolConfig, caitlynService) {
+  constructor(frontendWs, poolConfig, caitlynService) {
     this.frontendWs = frontendWs;
-    this.wasmService = wasmService;
     this.poolConfig = poolConfig;
     this.caitlynService = caitlynService;
     this.token = null;
@@ -391,11 +353,11 @@ class ClientHandler {
     logger.info('Testing universe seeds functionality...');
     
     // Use cached seeds data from shared service
-    const cachedSeedsCount = this.caitlynService.globalCachedSeeds.size;
+    const cachedSeedsCount = this.caitlynService.globalCachedSeeds?.size || 0;
     let totalEntries = 0;
     
     // Count total entries in cached seeds
-    for (const [key, seedData] of this.caitlynService.globalCachedSeeds) {
+    for (const [key, seedData] of this.caitlynService.globalCachedSeeds || []) {
       if (seedData.data && seedData.data.seedEntries) {
         totalEntries += seedData.data.seedEntries.length;
       }
@@ -467,7 +429,7 @@ class ClientHandler {
     const seedsToSend = [];
     
     // Use global cached seeds from service
-    for (const [key, seedData] of this.caitlynService.globalCachedSeeds) {
+    for (const [key, seedData] of this.caitlynService.globalCachedSeeds || []) {
       if (seedData.timestamp > sinceTimestamp) {
         seedsToSend.push({
           key,
@@ -481,7 +443,7 @@ class ClientHandler {
     this.sendToFrontend({
       type: 'cached_seeds_batch',
       seeds: seedsToSend,
-      totalCached: this.caitlynService.globalCachedSeeds.size,
+      totalCached: this.caitlynService.globalCachedSeeds?.size || 0,
       sinceTimestamp,
       currentTimestamp: Date.now()
     });

@@ -10,8 +10,11 @@
 6. [Practical Implementation](#practical-implementation)
 7. [Schema-Based Field Access](#schema-based-field-access)
 8. [Market Data Processing](#market-data-processing)
-9. [Best Practices](#best-practices)
-10. [Integration Examples](#integration-examples)
+9. [Command Constants](#command-constants)
+10. [WASM Class Hierarchy](#wasm-class-hierarchy)
+11. [Protocol Flow](#protocol-flow)
+12. [Best Practices](#best-practices)
+13. [Integration Examples](#integration-examples)
 
 ## Introduction
 
@@ -514,6 +517,259 @@ function requestUniverseSeeds(client, marketsData) {
     
     console.log(`Universe seeds requests completed: ${requestsSent} requests sent`);
 }
+```
+
+## Command Constants
+
+### WebSocket Protocol Commands
+
+The Caitlyn protocol uses specific command constants for different message types. These constants are essential for proper message routing and handling:
+
+```javascript
+const CAITLYN_COMMANDS = {
+  // Network layer commands
+  NET_CMD_GOLD_ROUTE_DATADEF: 26216,    // Schema definition
+  NET_CMD_GOLD_ROUTE_KEEPALIVE: '<value>', // Keepalive messages
+  
+  // Application layer commands
+  CMD_AT_UNIVERSE_REV: 20483,           // Universe revision request/response
+  CMD_AT_UNIVERSE_SEEDS: '<value>',     // Universe seeds request/response
+  CMD_AT_FETCH_BY_CODE: '<value>',      // Fetch by code
+  CMD_AT_FETCH_BY_TIME: '<value>',      // Fetch by time
+  CMD_AT_SUBSCRIBE: '<value>',          // Subscribe to data
+  CMD_AT_UNSUBSCRIBE: '<value>',        // Unsubscribe from data
+  
+  // Trading commands
+  CMD_AT_MANUAL_TRADE: '<value>',       // Manual trade
+  CMD_AT_MANUAL_EDIT: '<value>',        // Edit manual trade
+  
+  // Account management
+  CMD_AT_ACCOUNT_ADD: '<value>',        // Add account
+  CMD_AT_ACCOUNT_EDIT: '<value>',       // Edit account
+  CMD_AT_ACCOUNT_DEL: '<value>',        // Delete account
+  
+  // Strategy management
+  CMD_AT_ADD_STRATEGY_INSTANCE: '<value>', // Add strategy instance
+  CMD_AT_DEL_STRATEGY_INSTANCE: '<value>', // Delete strategy instance
+  CMD_AT_EDIT_STRATEGY_INSTANCE: '<value>', // Edit strategy instance
+  CMD_AT_QUERY_STRATEGY_INSTANCE: '<value>', // Query strategy instance
+  
+  // Backtesting
+  CMD_AT_START_BACKTEST: '<value>',     // Start backtest
+  CMD_AT_CTRL_BACKTEST: '<value>',      // Control backtest
+  CMD_AT_SHARE_BACKTEST: '<value>',     // Share backtest
+  
+  // Market data
+  CMD_TA_MARKET_STATUS: '<value>',      // Market status
+  CMD_TA_PUSH_DATA: '<value>',          // Push market data
+  CMD_TA_MARKET_SINGULARITY: '<value>', // Market singularity
+  
+  // Formula and calculation
+  CMD_AT_RUN_FORMULA: '<value>',        // Run formula
+  CMD_AT_REG_FORMULA: '<value>',        // Register formula
+  CMD_AT_DEL_FORMULA: '<value>',        // Delete formula
+  CMD_AT_CAL_FORMULA: '<value>',        // Calculate formula
+  
+  // Library management
+  CMD_AT_REG_LIBRARIES: '<value>',      // Register libraries
+  CMD_AT_MODIFY_BASKET: '<value>',      // Modify basket
+  
+  // Debug and system
+  CMD_AT_DEBUG_LIVE: '<value>',         // Debug live
+  CMD_AT_DEBUG_COVERUP: '<value>',      // Debug coverup
+  CMD_AT_DEBUG_ADD_ACCOUNT: '<value>',  // Debug add account
+  CMD_AT_HANDSHAKE: '<value>',          // Handshake
+  CMD_AT_QUERY_ORDERS: '<value>'        // Query orders
+};
+```
+
+## WASM Class Hierarchy
+
+### Core Classes
+
+The Caitlyn WASM module provides a comprehensive set of classes for handling different aspects of the financial system:
+
+```javascript
+const WASM_CORE_CLASSES = {
+  // Network and serialization
+  'NetPackage': 'Binary message container with header and content',
+  'IndexSchema': 'Schema definition container',
+  'IndexSerializer': 'Data compression/decompression engine',
+  'IndexMeta': 'Metadata definition with fields',
+  
+  // Data structures
+  'StructValue': 'Dynamic data container with typed field access',
+  'RevisionMap': 'Map from string keys to StructValueConstVector',
+  'StructValueConstVector': 'Vector of StructValue objects',
+  
+  // Request classes
+  'ATUniverseReq': 'Universe revision request',
+  'ATUniverseSeedsReq': 'Universe seeds request',
+  'ATFetchByCodeReq': 'Fetch by code request',
+  'ATFetchByTimeReq': 'Fetch by time request',
+  'ATSubscribeReq': 'Subscribe request',
+  'ATUnsubscribeReq': 'Unsubscribe request',
+  'ATBaseRequest': 'Base request class',
+  'ATBaseFormulaReq': 'Base formula request',
+  
+  // Response classes
+  'ATUniverseRes': 'Universe revision response',
+  'ATUniverseSeedsRes': 'Universe seeds response', 
+  'ATFetchSVRes': 'Fetch StructValue response',
+  'ATSubscribeRes': 'Subscribe response',
+  'ATBaseResponse': 'Base response class',
+  
+  // Trading classes
+  'ATManualTradeReq': 'Manual trade request',
+  'ATManualTradeRes': 'Manual trade response',
+  'ATManualTradeEditReq': 'Manual trade edit request',
+  
+  // Account management
+  'ATAccountAddReq': 'Add account request',
+  'ATAccountAddRes': 'Add account response',
+  'ATAccountEditReq': 'Edit account request',
+  'ATAccountDelReq': 'Delete account request',
+  
+  // Strategy management
+  'ATAddStrategyInstanceReq': 'Add strategy instance request',
+  'ATAddStrategyInstanceRes': 'Add strategy instance response',
+  'ATDelStrategyInstanceReq': 'Delete strategy instance request',
+  'ATEditStrategyInstanceReq': 'Edit strategy instance request',
+  'ATQueryStrategyInstanceReq': 'Query strategy instance request',
+  'ATQueryStrategyInstanceRes': 'Query strategy instance response',
+  'ATQueryStrategyInstanceLogReq': 'Query strategy instance log request',
+  
+  // Backtesting
+  'ATStartBacktestReq': 'Start backtest request',
+  'ATStartBacktestRes': 'Start backtest response',
+  'ATControlBacktestReq': 'Control backtest request',
+  
+  // Formula and calculation
+  'ATRegFormulaRes': 'Register formula response',
+  'ATDelFormulaReq': 'Delete formula request',
+  'ATCalFormulaRes': 'Calculate formula response',
+  
+  // Library management
+  'ATRegLibrariesReq': 'Register libraries request',
+  'ATRegLibrariesRes': 'Register libraries response',
+  'ATModifyBasketReq': 'Modify basket request'
+};
+```
+
+### Class Constructor Patterns
+
+Different WASM classes have different constructor requirements:
+
+```javascript
+// Request classes typically take (token, sequence_id, ...)
+const REQUEST_PATTERNS = {
+  'ATUniverseReq': '(token, sequence_id)',
+  'ATUniverseSeedsReq': '(token, sequence_id, revision, namespace, qualified_name, market_code, trade_day)',
+  'ATFetchByCodeReq': '(token, sequence_id, ...)',
+  'ATSubscribeReq': '(token, sequence_id)',
+};
+
+// Response classes vary in constructor requirements
+const RESPONSE_PATTERNS = {
+  'ATUniverseRes': '() - requires setCompressor() before decode()',
+  'ATUniverseSeedsRes': '() - requires setCompressor() before decode()',
+  'ATFetchSVRes': '() - requires setCompressor() before decode()',
+  'ATSubscribeRes': '(sequence_id, token)',
+  'ATBaseResponse': '() - no setCompressor() method',
+};
+```
+
+## Protocol Flow
+
+### Complete Universe Initialization Sequence
+
+The complete Singularity initialization follows a specific protocol sequence:
+
+```javascript
+const INITIALIZATION_FLOW = {
+  1: {
+    trigger: 'WebSocket Connection Established',
+    client_sends: 'Handshake JSON message',
+    message: '{"cmd":20512, "token":"<TOKEN>", "protocol":1, "seq":1}'
+  },
+  
+  2: {
+    trigger: 'Server Response',
+    server_sends: 'NET_CMD_GOLD_ROUTE_DATADEF (26216)',
+    client_action: [
+      'Create IndexSchema',
+      'Load schema from message content',
+      'Build global _schema lookup',
+      'Initialize IndexSerializer with schema',
+      'Clean up schema object',
+      'Send ATUniverseReq'
+    ]
+  },
+  
+  3: {
+    trigger: 'Schema Loaded',
+    client_sends: 'CMD_AT_UNIVERSE_REV (20483)',
+    request_class: 'ATUniverseReq(TOKEN, 2)',
+    purpose: 'Request universe revision data'
+  },
+  
+  4: {
+    trigger: 'Universe Revision Response',
+    server_sends: 'CMD_AT_UNIVERSE_REV (20483)',
+    response_class: 'ATUniverseRes()',
+    client_action: [
+      'Create ATUniverseRes',
+      'Set compressor reference',
+      'Decode message content',
+      'Extract RevisionMap from res.revs()',
+      'Iterate through namespaces (global, private)',
+      'Process StructValue entries',
+      'Extract market codes from sv.stockCode',
+      'Parse revisions JSON from sv.getString(7)',
+      'Clean up response object',
+      'Send multiple ATUniverseSeedsReq (one per market + qualified_name combo)'
+    ]
+  },
+  
+  5: {
+    trigger: 'Universe Revision Processed',
+    client_sends: 'Multiple CMD_AT_UNIVERSE_SEEDS requests',
+    request_pattern: 'ATUniverseSeedsReq(TOKEN, seq++, revision, namespace, qualified_name, market_code, trade_day)',
+    typical_count: '60 requests (10 markets × 6 qualified_names)',
+    qualified_names: ['Commodity', 'Dividend', 'Futures', 'Holiday', 'Security', 'Stock']
+  },
+  
+  6: {
+    trigger: 'Universe Seeds Responses',
+    server_sends: 'Multiple CMD_AT_UNIVERSE_SEEDS responses',
+    response_class: 'ATUniverseSeedsRes()',
+    content: 'Seed data for each market/qualified_name combination',
+    completion: 'Universe initialization complete when all seeds received'
+  }
+};
+```
+
+### Critical Implementation Notes
+
+1. **Memory Management**: All WASM objects created with `new` MUST be deleted with `.delete()`
+2. **Compressor Lifecycle**: IndexSerializer must be initialized once after schema loading and reused
+3. **Field Access Pattern**: Market revisions are in field[7] as JSON string, not field[1]
+4. **Market Structure**: Markets are keyed by stockCode (CFFEX, CZCE, etc.) with nested revisions
+5. **Token Usage**: Authentication token must be used consistently, never hardcoded "test"
+6. **Namespace Mapping**: 'global' maps to 0, 'private' maps to 1 in schema lookups
+7. **SharedArrayBuffer**: WebSocket send requires copying ArrayBuffer, not direct WASM buffer
+
+### Error Patterns to Avoid
+
+```javascript
+const COMMON_ERRORS = {
+  'Memory Leaks': 'Not calling .delete() on WASM objects',
+  'Wrong Field Access': 'Using getString(1) instead of getString(7) for revisions',
+  'Schema Premature Deletion': 'Deleting schema before compressor initialization',
+  'SharedArrayBuffer Error': 'Sending WASM ArrayBuffer directly to WebSocket',
+  'Hardcoded Values': 'Using "test" instead of actual authentication token',
+  'Incorrect Market Structure': 'Expecting metaName keys instead of market code keys'
+};
 ```
 
 ## Best Practices

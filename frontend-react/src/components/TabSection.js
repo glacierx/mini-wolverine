@@ -3,350 +3,194 @@ import styled from 'styled-components';
 import { useData } from '../contexts/DataContext';
 import { useBackendWebSocket } from '../contexts/BackendWebSocketContext';
 import HistoricalDataQuery from './HistoricalDataQuery';
+import SchemaViewer from './SchemaViewer';
 
-const TabsContainer = styled.section`
-  background: var(--card-background);
-  border: 1px solid var(--border-color);
-  border-radius: var(--border-radius);
-  box-shadow: var(--shadow);
+const Container = styled.div`
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
   overflow: hidden;
-  margin-bottom: 20px;
 `;
 
-const TabButtons = styled.div`
+const TabNav = styled.nav`
   display: flex;
   background: #f8f9fa;
-  border-bottom: 1px solid var(--border-color);
-  overflow-x: auto;
+  border-bottom: 1px solid #dee2e6;
 `;
 
 const TabButton = styled.button`
-  padding: 12px 20px;
+  padding: 16px 24px;
   border: none;
   background: transparent;
-  color: var(--text-muted);
-  font-weight: 600;
+  color: #6c757d;
+  font-weight: 500;
   cursor: pointer;
-  border-bottom: 3px solid transparent;
-  transition: all 0.3s ease;
-  white-space: nowrap;
+  transition: all 0.2s;
   
   &.active {
-    color: var(--secondary-color);
-    border-bottom-color: var(--secondary-color);
-    background: var(--card-background);
+    color: #0066cc;
+    background: white;
+    border-bottom: 2px solid #0066cc;
   }
   
   &:hover:not(.active) {
-    color: var(--text-color);
-    background: rgba(52, 152, 219, 0.1);
+    color: #495057;
   }
 `;
 
 const TabContent = styled.div`
+  padding: 24px;
   min-height: 400px;
 `;
 
-const TabPanel = styled.div`
-  padding: 20px;
-  display: ${props => props.$active ? 'block' : 'none'};
-`;
-
-const PanelHeader = styled.div`
+const SectionHeader = styled.div`
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 20px;
 `;
 
-const PanelTitle = styled.h3`
+const Title = styled.h3`
   margin: 0;
-  color: var(--primary-color);
+  color: #212529;
   font-size: 18px;
   font-weight: 600;
 `;
 
+const SimpleButton = styled.button`
+  background: #0066cc;
+  color: white;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  
+  &:hover {
+    background: #0052a3;
+  }
+  
+  &:disabled {
+    background: #6c757d;
+    cursor: not-allowed;
+  }
+`;
+
+const ContentBox = styled.div`
+  background: #f8f9fa;
+  border: 1px solid #dee2e6;
+  border-radius: 6px;
+  max-height: 500px;
+  overflow-y: auto;
+`;
+
 const EmptyState = styled.div`
   text-align: center;
-  color: var(--text-muted);
-  padding: 40px 20px;
-  font-style: italic;
+  color: #6c757d;
+  padding: 60px 20px;
+  font-size: 14px;
 `;
 
-const PlaceholderContent = styled.div`
-  padding: 20px;
-  background: #f8f9fa;
-  border: 1px dashed var(--border-color);
-  border-radius: var(--border-radius);
-  text-align: center;
-  color: var(--text-muted);
-`;
 
-const SchemaContainer = styled.div`
-  max-height: 400px;
-  overflow-y: auto;
-  background: #f8f9fa;
-  border: 1px solid var(--border-color);
-  border-radius: var(--border-radius);
-`;
-
-const SchemaNamespace = styled.div`
-  border-bottom: 1px solid var(--border-color);
+// Console Components
+const LogEntry = styled.div`
+  padding: 8px 16px;
+  border-bottom: 1px solid #f1f3f4;
+  font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace;
+  font-size: 13px;
   
-  &:last-child {
-    border-bottom: none;
-  }
+  &:last-child { border-bottom: none; }
 `;
 
-const SchemaHeader = styled.div`
-  padding: 12px 16px;
-  background: var(--primary-color);
-  color: white;
+const LogTime = styled.span`
+  color: #6c757d;
+  margin-right: 12px;
+`;
+
+const LogLevel = styled.span`
   font-weight: 600;
-  cursor: pointer;
+  margin-right: 12px;
   
-  &:hover {
-    background: #2980b9;
-  }
-`;
-
-const SchemaItems = styled.div`
-  padding: 0;
-`;
-
-const SchemaItem = styled.div`
-  padding: 8px 24px;
-  border-bottom: 1px solid #e9ecef;
-  font-family: 'Courier New', monospace;
-  font-size: 12px;
-  
-  &:last-child {
-    border-bottom: none;
-  }
-  
-  &:hover {
-    background: #f1f3f4;
-  }
-`;
-
-const MessageContainer = styled.div`
-  max-height: 400px;
-  overflow-y: auto;
-  background: #f8f9fa;
-  border: 1px solid var(--border-color);
-  border-radius: var(--border-radius);
-  font-family: 'Courier New', monospace;
-  font-size: 12px;
-`;
-
-const Message = styled.div`
-  padding: 8px 12px;
-  border-bottom: 1px solid #e9ecef;
-  
-  &:last-child {
-    border-bottom: none;
-  }
-  
-  &:hover {
-    background: #f1f3f4;
-  }
-`;
-
-const MessageTime = styled.span`
-  color: var(--text-muted);
-  margin-right: 10px;
-`;
-
-const MessageType = styled.span`
-  color: var(--secondary-color);
-  font-weight: 600;
-  margin-right: 10px;
+  &.error { color: #dc3545; }
+  &.success { color: #28a745; }
+  &.warning { color: #ffc107; }
+  &.info { color: #17a2b8; }
 `;
 
 function TabSection() {
-  const [activeTab, setActiveTab] = useState('console');
-  const [expandedNamespaces, setExpandedNamespaces] = useState(new Set());
-  const { schema, marketData, logs, rawMessages } = useData();
-  const { isConnected, caitlynConnected } = useBackendWebSocket();
-
-  const toggleNamespace = (namespace) => {
-    const newExpanded = new Set(expandedNamespaces);
-    if (newExpanded.has(namespace)) {
-      newExpanded.delete(namespace);
-    } else {
-      newExpanded.add(namespace);
-    }
-    setExpandedNamespaces(newExpanded);
-  };
+  const [activeTab, setActiveTab] = useState('schema');
+  const { logs } = useData();
 
   const tabs = [
-    { id: 'console', label: 'Console' },
-    { id: 'schema', label: 'Schema' },
-    { id: 'data', label: 'Market Data' },
+    { id: 'schema', label: 'Schema & Revisions' },
     { id: 'historical', label: 'Historical Data' },
-    { id: 'raw', label: 'Raw Messages' }
+    { id: 'console', label: 'Console' }
   ];
 
-  const renderTabContent = (tabId) => {
-    switch (tabId) {
-      case 'console':
-        return (
-          <div>
-            <PanelHeader>
-              <PanelTitle>📝 Application Console</PanelTitle>
-              <button className="btn btn-mini btn-secondary">Export Logs</button>
-            </PanelHeader>
-            {logs && logs.length > 0 ? (
-              <MessageContainer>
-                {logs.map((log, index) => (
-                  <Message key={index}>
-                    <MessageTime>{new Date(log.timestamp).toLocaleTimeString()}</MessageTime>
-                    <MessageType style={{color: 
-                      log.level === 'error' ? '#e74c3c' :
-                      log.level === 'success' ? '#27ae60' :
-                      log.level === 'warning' ? '#f39c12' : '#3498db'
-                    }}>
-                      {log.level.toUpperCase()}
-                    </MessageType>
-                    <div style={{ marginTop: '4px' }}>
-                      {log.message}
-                      {log.data && (
-                        <div style={{ marginTop: '2px', fontSize: '11px', color: '#666' }}>
-                          {typeof log.data === 'string' ? log.data : JSON.stringify(log.data)}
-                        </div>
-                      )}
-                    </div>
-                  </Message>
-                ))}
-              </MessageContainer>
-            ) : (
-              <EmptyState>
-                No logs yet. Connect to backend and Caitlyn server to see application logs.
-              </EmptyState>
-            )}
-          </div>
-        );
-        
-      case 'schema':
-        return (
-          <div>
-            <PanelHeader>
-              <PanelTitle>🏗️ Data Schema</PanelTitle>
-              <button className="btn btn-mini btn-secondary">Refresh</button>
-            </PanelHeader>
-            {schema && Object.keys(schema).length > 0 ? (
-              <SchemaContainer>
-                {Object.keys(schema).map(namespaceKey => {
-                  const namespaceData = schema[namespaceKey];
-                  const namespaceName = namespaceKey === '0' ? 'Global' : namespaceKey === '1' ? 'Private' : `Namespace ${namespaceKey}`;
-                  const isExpanded = expandedNamespaces.has(namespaceKey);
-                  
-                  return (
-                    <SchemaNamespace key={namespaceKey}>
-                      <SchemaHeader onClick={() => toggleNamespace(namespaceKey)}>
-                        {isExpanded ? '▼' : '▶'} {namespaceName} ({Object.keys(namespaceData).length} definitions)
-                      </SchemaHeader>
-                      {isExpanded && (
-                        <SchemaItems>
-                          {Object.keys(namespaceData).map(metaId => {
-                            const metadata = namespaceData[metaId];
-                            return (
-                              <SchemaItem key={metaId}>
-                                <strong>ID {metaId}:</strong> {metadata.name || 'Unnamed'} 
-                                {metadata.description && ` - ${metadata.description}`}
-                              </SchemaItem>
-                            );
-                          })}
-                        </SchemaItems>
-                      )}
-                    </SchemaNamespace>
-                  );
-                })}
-              </SchemaContainer>
-            ) : (
-              <EmptyState>
-                No schema loaded. Connect to server to load schema definitions.
-              </EmptyState>
-            )}
-          </div>
-        );
-        
-      case 'data':
-        return (
-          <div>
-            <PanelHeader>
-              <PanelTitle>📈 Market Data</PanelTitle>
-              <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-                <select style={{ padding: '6px 10px', borderRadius: '4px', border: '1px solid var(--border-color)' }}>
-                  <option value="">All Namespaces</option>
-                </select>
-                <button className="btn btn-mini btn-secondary">Export Data</button>
-              </div>
-            </PanelHeader>
-            <EmptyState>
-              No market data available. Establish connection and request data.
-            </EmptyState>
-          </div>
-        );
-        
-      case 'historical':
-        return (
-          <div>
-            <PanelHeader>
-              <PanelTitle>📊 Historical Data Query</PanelTitle>
-              <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-                <select style={{ padding: '6px 10px', borderRadius: '4px', border: '1px solid var(--border-color)' }}>
-                  <option value="table">Table View</option>
-                  <option value="chart">Chart View</option>
-                </select>
-                <button className="btn btn-mini btn-secondary">Export Data</button>
-              </div>
-            </PanelHeader>
-            <HistoricalDataQuery />
-          </div>
-        );
-        
-      case 'raw':
-        return (
-          <div>
-            <PanelHeader>
-              <PanelTitle>🔍 Raw Messages</PanelTitle>
-              <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
-                  <input type="checkbox" defaultChecked />
-                  Auto-scroll
-                </label>
-                <button className="btn btn-mini btn-secondary">Export</button>
-              </div>
-            </PanelHeader>
-            {rawMessages && rawMessages.length > 0 ? (
-              <MessageContainer>
-                {rawMessages.map((message, index) => (
-                  <Message key={index}>
-                    <MessageTime>{new Date(message.timestamp).toLocaleTimeString()}</MessageTime>
-                    <MessageType>{message.type}</MessageType>
-                    <div style={{ marginTop: '4px', color: '#666' }}>
-                      {typeof message.data === 'string' ? message.data : JSON.stringify(message.data, null, 2)}
-                    </div>
-                  </Message>
-                ))}
-              </MessageContainer>
-            ) : (
-              <EmptyState>
-                No raw messages captured yet. {caitlynConnected ? 'Messages will appear here once data starts flowing.' : 'Connect to Caitlyn server to see messages.'}
-              </EmptyState>
-            )}
-          </div>
-        );
-        
-      default:
-        return <EmptyState>Tab content not implemented</EmptyState>;
+  const renderSchema = () => (
+    <div>
+      <SectionHeader>
+        <Title>Schema Definitions</Title>
+      </SectionHeader>
+      <SchemaViewer />
+    </div>
+  );
+
+  const renderHistorical = () => (
+    <div>
+      <SectionHeader>
+        <Title>Historical Data Query</Title>
+      </SectionHeader>
+      <HistoricalDataQuery />
+    </div>
+  );
+
+  const renderConsole = () => (
+    <div>
+      <SectionHeader>
+        <Title>Application Console</Title>
+        <SimpleButton onClick={() => window.location.reload()}>
+          Clear
+        </SimpleButton>
+      </SectionHeader>
+      
+      <ContentBox>
+        {logs && logs.length > 0 ? (
+          logs.slice(-50).map((log, index) => (
+            <LogEntry key={index}>
+              <LogTime>{new Date(log.timestamp).toLocaleTimeString()}</LogTime>
+              <LogLevel className={log.level}>{log.level.toUpperCase()}</LogLevel>
+              <span>{log.message}</span>
+              {log.data && (
+                <div style={{ marginTop: '4px', opacity: 0.7, fontSize: '12px' }}>
+                  {typeof log.data === 'string' ? log.data : JSON.stringify(log.data)}
+                </div>
+              )}
+            </LogEntry>
+          ))
+        ) : (
+          <EmptyState>
+            No logs yet.<br />
+            Connect to backend to see application logs.
+          </EmptyState>
+        )}
+      </ContentBox>
+    </div>
+  );
+
+  const renderTabContent = () => {
+    switch (activeTab) {
+      case 'schema': return renderSchema();
+      case 'historical': return renderHistorical();
+      case 'console': return renderConsole();
+      default: return <EmptyState>Select a tab</EmptyState>;
     }
   };
 
   return (
-    <TabsContainer>
-      <TabButtons>
+    <Container>
+      <TabNav>
         {tabs.map(tab => (
           <TabButton
             key={tab.id}
@@ -356,16 +200,12 @@ function TabSection() {
             {tab.label}
           </TabButton>
         ))}
-      </TabButtons>
+      </TabNav>
       
       <TabContent>
-        {tabs.map(tab => (
-          <TabPanel key={tab.id} $active={activeTab === tab.id}>
-            {renderTabContent(tab.id)}
-          </TabPanel>
-        ))}
+        {renderTabContent()}
       </TabContent>
-    </TabsContainer>
+    </Container>
   );
 }
 
