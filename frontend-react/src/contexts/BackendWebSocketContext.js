@@ -28,7 +28,8 @@ const initialState = {
     lastMessageType: null,
     lastMessageTime: null,
     cachedSeedsCount: 0
-  }
+  },
+  lastMessage: null  // Store complete message for components to access
 };
 
 // Action types
@@ -47,7 +48,8 @@ const WS_ACTIONS = {
   UPDATE_CACHED_SEEDS: 'UPDATE_CACHED_SEEDS',
   BATCH_UPDATE_CACHED_SEEDS: 'BATCH_UPDATE_CACHED_SEEDS',
   SET_POOL_READY: 'SET_POOL_READY',
-  UPDATE_POOL_STATS: 'UPDATE_POOL_STATS'
+  UPDATE_POOL_STATS: 'UPDATE_POOL_STATS',
+  SET_LAST_MESSAGE: 'SET_LAST_MESSAGE'
 };
 
 // Reducer
@@ -172,6 +174,17 @@ function webSocketReducer(state, action) {
         poolStats: { ...state.poolStats, ...action.payload }
       };
       
+    case WS_ACTIONS.SET_LAST_MESSAGE:
+      return {
+        ...state,
+        lastMessage: action.payload,
+        stats: {
+          ...state.stats,
+          lastMessageType: action.payload?.type || null,
+          lastMessageTime: new Date().toISOString()
+        }
+      };
+      
     default:
       return state;
   }
@@ -253,14 +266,18 @@ export function BackendWebSocketProvider({ children }) {
         const message = JSON.parse(event.data);
         console.log('📨 Backend message:', message.type);
         
+        // Store the complete message for components to access
+        dispatch({ 
+          type: WS_ACTIONS.SET_LAST_MESSAGE, 
+          payload: message 
+        });
+        
         handleBackendMessage(message);
         
         dispatch({ 
           type: WS_ACTIONS.UPDATE_STATS, 
           payload: { 
-            messagesReceived: state.stats.messagesReceived + 1,
-            lastMessageType: message.type,
-            lastMessageTime: new Date().toISOString()
+            messagesReceived: state.stats.messagesReceived + 1
           } 
         });
       };
@@ -599,6 +616,17 @@ export function BackendWebSocketProvider({ children }) {
           payload: message.message 
         });
         dataActions.addLog('error', 'Backend error', { error: message.message });
+        break;
+        
+      case 'fetch_by_code_response':
+        console.log('📊 Fetch by code response received:', message.success ? 'Success' : 'Failed');
+        // The SchemaViewer component handles this message directly via useEffect
+        // No additional processing needed here - just pass it through
+        break;
+        
+      case 'historical_data':
+        console.log('📈 Historical data message received');
+        // This is also handled by SchemaViewer component
         break;
         
       default:

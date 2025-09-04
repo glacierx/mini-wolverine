@@ -1,6 +1,46 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import styled from 'styled-components';
 import { useData } from '../contexts/DataContext';
+import { useBackendWebSocket } from '../contexts/BackendWebSocketContext';
+
+// Helper function to render complex field values
+const renderFieldValue = (value) => {
+  if (value === null || value === undefined) {
+    return <span style={{ color: '#6c757d', fontStyle: 'italic' }}>null</span>;
+  }
+  
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return <span style={{ color: '#6c757d', fontStyle: 'italic' }}>[]</span>;
+    }
+    
+    // Show first few elements for arrays
+    const preview = value.slice(0, 3).map(item => 
+      typeof item === 'number' ? item.toFixed(3) : String(item)
+    ).join(', ');
+    
+    const suffix = value.length > 3 ? `, ...${value.length - 3} more` : '';
+    return <span title={JSON.stringify(value)} style={{ color: '#0066cc' }}>
+      [{preview}{suffix}]
+    </span>;
+  }
+  
+  if (typeof value === 'object') {
+    return <span title={JSON.stringify(value)} style={{ color: '#0066cc' }}>
+      {'{...}'}
+    </span>;
+  }
+  
+  if (typeof value === 'number') {
+    return value.toFixed(4);
+  }
+  
+  if (typeof value === 'string' && value.length > 50) {
+    return <span title={value}>{value.substring(0, 50)}...</span>;
+  }
+  
+  return String(value);
+};
 
 const Container = styled.div`
   display: flex;
@@ -74,7 +114,9 @@ const TreeNode = styled.div`
   user-select: none;
 `;
 
-const TreeItem = styled.div`
+const TreeItem = styled.div.withConfig({
+  shouldForwardProp: (prop) => !['selected', 'level', 'isRevision'].includes(prop)
+})`
   padding: 8px;
   padding-left: ${props => props.level * 20 + 12}px;
   cursor: pointer;
@@ -166,11 +208,382 @@ const MetaInfo = styled.div`
   color: #495057;
 `;
 
+const TabContainer = styled.div`
+  display: flex;
+  border-bottom: 1px solid #dee2e6;
+  background: #f8f9fa;
+`;
+
+const Tab = styled.button`
+  flex: 1;
+  padding: 12px 16px;
+  border: none;
+  background: ${props => props.$active ? '#ffffff' : 'transparent'};
+  color: ${props => props.$active ? '#495057' : '#6c757d'};
+  font-weight: ${props => props.$active ? '600' : 'normal'};
+  cursor: pointer;
+  border-bottom: ${props => props.$active ? '2px solid #0066cc' : '2px solid transparent'};
+  transition: all 0.2s ease;
+  
+  &:hover {
+    background: ${props => props.$active ? '#ffffff' : '#e9ecef'};
+    color: #495057;
+  }
+  
+  &:focus {
+    outline: none;
+    box-shadow: inset 0 0 0 2px rgba(0, 102, 204, 0.25);
+  }
+`;
+
+const TabContent = styled.div`
+  height: calc(100% - 47px);
+  overflow-y: auto;
+`;
+
+const QueryPanel = styled.div`
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+`;
+
+const QuerySection = styled.div`
+  background: #f8f9fa;
+  border: 1px solid #dee2e6;
+  border-radius: 8px;
+  padding: 16px;
+`;
+
+const SectionTitle = styled.h4`
+  margin: 0 0 12px 0;
+  color: #495057;
+  font-size: 14px;
+  font-weight: 600;
+`;
+
+const FormRow = styled.div`
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+  align-items: center;
+  
+  &:last-child {
+    margin-bottom: 0;
+  }
+`;
+
+const FormLabel = styled.label`
+  min-width: 100px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #495057;
+`;
+
+const FormInput = styled.input`
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  font-size: 13px;
+  
+  &:focus {
+    outline: none;
+    border-color: #0066cc;
+    box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.25);
+  }
+`;
+
+const FormSelect = styled.select`
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  font-size: 13px;
+  background: white;
+  
+  &:focus {
+    outline: none;
+    border-color: #0066cc;
+    box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.25);
+  }
+`;
+
+const FieldSelector = styled.div`
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid #dee2e6;
+  border-radius: 4px;
+  background: white;
+`;
+
+const FieldOption = styled.label`
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  border-bottom: 1px solid #f1f3f4;
+  
+  &:hover {
+    background: #f8f9fa;
+  }
+  
+  &:last-child {
+    border-bottom: none;
+  }
+  
+  input {
+    margin-right: 8px;
+  }
+`;
+
+const QueryButton = styled.button`
+  padding: 10px 20px;
+  background: #0066cc;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  
+  &:hover {
+    background: #0056b3;
+  }
+  
+  &:disabled {
+    background: #6c757d;
+    cursor: not-allowed;
+  }
+  
+  &:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.25);
+  }
+`;
+
+const DataGrid = styled.div`
+  border: 1px solid #dee2e6;
+  border-radius: 4px;
+  overflow: hidden;
+`;
+
+const DataTable = styled.table`
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+`;
+
+const DataHeader = styled.th`
+  background: #f8f9fa;
+  padding: 10px 8px;
+  text-align: left;
+  border-bottom: 2px solid #dee2e6;
+  font-weight: 600;
+  color: #495057;
+  position: sticky;
+  top: 0;
+`;
+
+const DataRow = styled.tr`
+  &:nth-child(even) {
+    background: #f9f9f9;
+  }
+  
+  &:hover {
+    background: #e3f2fd;
+  }
+`;
+
+const DataCell = styled.td`
+  padding: 8px;
+  border-bottom: 1px solid #f1f3f4;
+  vertical-align: top;
+  font-family: monospace;
+  font-size: 11px;
+`;
+
+const ComboContainer = styled.div`
+  position: relative;
+  flex: 1;
+`;
+
+const ComboInput = styled.input`
+  width: 100%;
+  padding: 8px 32px 8px 12px;
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  font-size: 13px;
+  
+  &:focus {
+    outline: none;
+    border-color: #0066cc;
+    box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.25);
+  }
+`;
+
+const ComboButton = styled.button`
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: #f8f9fa;
+  border-radius: 3px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: #6c757d;
+  
+  &:hover {
+    background: #e9ecef;
+    color: #495057;
+  }
+  
+  &:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(0, 102, 204, 0.25);
+  }
+`;
+
+const DropdownList = styled.div`
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  background: white;
+  border: 1px solid #ced4da;
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  max-height: 200px;
+  overflow-y: auto;
+  z-index: 1000;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+`;
+
+const DropdownItem = styled.div`
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  border-bottom: 1px solid #f1f3f4;
+  
+  &:hover {
+    background: #f8f9fa;
+  }
+  
+  &:last-child {
+    border-bottom: none;
+  }
+  
+  .code {
+    font-weight: 500;
+    color: #495057;
+  }
+  
+  .name {
+    font-size: 11px;
+    color: #6c757d;
+    margin-left: 8px;
+  }
+`;
+
 function SchemaViewer() {
-  const { schema, marketData } = useData();
+  const { schema, marketData, securities } = useData();
+  const { sendMessage, lastMessage } = useBackendWebSocket();
   const [expandedNodes, setExpandedNodes] = useState(new Set());
   const [selectedRevision, setSelectedRevision] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [activeTab, setActiveTab] = useState('fields');
+  
+  // Historical data query state
+  const [selectedFields, setSelectedFields] = useState(new Set());
+  const [market, setMarket] = useState('');
+  const [code, setCode] = useState('');
+  const [fromTime, setFromTime] = useState('');
+  const [toTime, setToTime] = useState('');
+  const [granularity, setGranularity] = useState('86400'); // Default to 1 day
+  const [historicalData, setHistoricalData] = useState([]);
+  const [isQuerying, setIsQuerying] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [itemsPerPage] = useState(100);
+  
+  // Dropdown state
+  const [showMarketDropdown, setShowMarketDropdown] = useState(false);
+  const [showCodeDropdown, setShowCodeDropdown] = useState(false);
+  const [marketFilter, setMarketFilter] = useState('');
+  const [codeFilter, setCodeFilter] = useState('');
+  
+  // Handle WebSocket messages for historical data responses
+  useEffect(() => {
+    if (lastMessage && lastMessage.type === 'fetch_by_code_response') {
+      console.log('🔍 DEBUG: Processing fetch_by_code_response', {
+        lastMessage: lastMessage,
+        success: lastMessage.success,
+        hasData: !!lastMessage.data
+      });
+      
+      setIsQuerying(false);
+      
+      if (lastMessage.success && lastMessage.data) {
+        const responseData = lastMessage.data;
+        
+        console.log('🔍 DEBUG: Response data structure', {
+          responseData: responseData,
+          hasRecords: !!responseData.records,
+          recordsIsArray: Array.isArray(responseData.records),
+          recordCount: responseData.records?.length || 0
+        });
+        
+        // Convert backend response to frontend format
+        let processedData = [];
+        if (responseData.records && Array.isArray(responseData.records)) {
+          processedData = responseData.records.map((record, index) => {
+            // Flatten the fields structure for data grid access
+            const flatRecord = {
+              ...record,
+              row_id: index + 1,
+              timestamp: record.timestamp ? 
+                new Date(parseInt(record.timestamp)).toISOString() : 
+                new Date().toISOString() // Parse timestamp from milliseconds
+            };
+            
+            // If fields are nested under a "fields" property, flatten them to top level
+            if (record.fields && typeof record.fields === 'object') {
+              Object.assign(flatRecord, record.fields);
+            }
+            
+            return flatRecord;
+          });
+        }
+        
+        console.log('🔍 DEBUG: Setting historicalData', {
+          processedDataLength: processedData.length,
+          firstRecord: processedData[0],
+          firstRecordKeys: processedData[0] ? Object.keys(processedData[0]) : [],
+          fieldsFlattened: processedData[0] && responseData.records[0] && responseData.records[0].fields ? 
+            'Yes - fields moved to top level' : 'No nested fields found'
+        });
+        
+        setHistoricalData(processedData);
+        setCurrentPage(1);
+        
+        console.log('Historical data received:', {
+          recordCount: processedData.length,
+          message: lastMessage.message,
+          source: responseData.source
+        });
+      } else {
+        console.error('Historical data fetch failed:', lastMessage.message);
+        alert('Historical data fetch failed: ' + (lastMessage.message || 'Unknown error'));
+      }
+    }
+  }, [lastMessage]);
 
 
   const treeData = useMemo(() => {
@@ -187,36 +600,48 @@ function SchemaViewer() {
       
       if (!namespaceData) return;
 
-      // Create meta children from schema data
-      const metaChildren = [];
+      // Group metas by name and collect all their revisions
+      const metaGroups = {};
       Object.entries(namespaceData).forEach(([metaId, metaInfo]) => {
         const metaName = metaInfo.displayName || 
                         (metaInfo.name && metaInfo.name.includes('::') ? metaInfo.name.split('::').pop() : metaInfo.name) ||
                         `Meta ${metaId}`;
         
-        // Each meta has a revision - create a single revision node
         const revision = metaInfo.revision || 0;
         
-        metaChildren.push({
-          id: `meta_${namespaceKey}_${metaId}`,
-          type: 'meta',
-          name: metaName,
+        if (!metaGroups[metaName]) {
+          metaGroups[metaName] = {
+            metaName,
+            revisions: []
+          };
+        }
+        
+        metaGroups[metaName].revisions.push({
+          id: `revision_${namespaceKey}_${metaId}_${revision}`,
+          type: 'revision',
+          name: `Rev ${revision}`,
           namespaceKey,
           metaName,
+          revision: revision,
           metaId,
           fullMeta: metaInfo,
-          children: [{
-            id: `revision_${namespaceKey}_${metaId}_${revision}`,
-            type: 'revision',
-            name: `Rev ${revision}`,
-            namespaceKey,
-            metaName,
-            revision: revision,
-            metaId,
-            fullMeta: metaInfo,
-            fullName: `${namespaceName.toLowerCase()}::${metaName}`
-          }]
+          fullName: `${namespaceName.toLowerCase()}::${metaName}`
         });
+      });
+      
+      // Create meta children with grouped revisions
+      const metaChildren = Object.entries(metaGroups).map(([metaName, group]) => {
+        // Sort revisions by revision number
+        const sortedRevisions = group.revisions.sort((a, b) => a.revision - b.revision);
+        
+        return {
+          id: `meta_${namespaceKey}_${metaName}`,
+          type: 'meta',
+          name: `${metaName} (${sortedRevisions.length} revision${sortedRevisions.length > 1 ? 's' : ''})`,
+          namespaceKey,
+          metaName,
+          children: sortedRevisions
+        };
       });
 
       if (metaChildren.length > 0) {
@@ -232,6 +657,65 @@ function SchemaViewer() {
 
     return tree;
   }, [schema]);
+
+  // Process available markets
+  const availableMarkets = useMemo(() => {
+    if (!marketData) return [];
+    
+    const markets = [];
+    
+    // Add global markets
+    if (marketData.global) {
+      Object.entries(marketData.global).forEach(([code, market]) => {
+        markets.push({
+          code: code,
+          name: market.name || code,
+          type: 'global'
+        });
+      });
+    }
+    
+    // Add private markets  
+    if (marketData.private) {
+      Object.entries(marketData.private).forEach(([code, market]) => {
+        markets.push({
+          code: code,
+          name: market.name || code,
+          type: 'private'
+        });
+      });
+    }
+    
+    return markets.sort((a, b) => a.code.localeCompare(b.code));
+  }, [marketData]);
+
+  // Process available securities/codes
+  const availableCodes = useMemo(() => {
+    if (!securities) return [];
+    
+    const codes = [];
+    
+    // Process securities by market
+    Object.entries(securities).forEach(([marketCode, securityList]) => {
+      if (Array.isArray(securityList)) {
+        securityList.forEach(security => {
+          if (security.codes && Array.isArray(security.codes)) {
+            security.codes.forEach((code, index) => {
+              const name = security.names && security.names[index] ? security.names[index] : code;
+              codes.push({
+                code: code,
+                name: name,
+                market: marketCode,
+                category: security.categories && security.categories[index] ? security.categories[index] : 'Unknown'
+              });
+            });
+          }
+        });
+      }
+    });
+    
+    return codes.sort((a, b) => a.code.localeCompare(b.code));
+  }, [securities]);
 
   const filteredTreeData = useMemo(() => {
     if (!searchQuery.trim()) return treeData;
@@ -418,6 +902,340 @@ function SchemaViewer() {
     );
   };
 
+  const renderMarketCombo = () => {
+    const filteredMarkets = availableMarkets.filter(m => 
+      m.code.toLowerCase().includes(marketFilter.toLowerCase()) ||
+      m.name.toLowerCase().includes(marketFilter.toLowerCase())
+    );
+
+    return (
+      <ComboContainer>
+        <ComboInput
+          type="text"
+          value={market}
+          onChange={(e) => {
+            setMarket(e.target.value);
+            setMarketFilter(e.target.value);
+            setShowMarketDropdown(true);
+          }}
+          onFocus={() => {
+            setMarketFilter(market);
+            setShowMarketDropdown(true);
+          }}
+          onBlur={() => {
+            // Delay hiding to allow click on dropdown items
+            setTimeout(() => setShowMarketDropdown(false), 150);
+          }}
+          placeholder="e.g., SHFE, DCE, CZCE or type to search..."
+        />
+        <ComboButton
+          type="button"
+          onClick={() => {
+            setMarketFilter('');
+            setShowMarketDropdown(!showMarketDropdown);
+          }}
+        >
+          ▼
+        </ComboButton>
+        {showMarketDropdown && (
+          <DropdownList>
+            {filteredMarkets.length > 0 ? (
+              filteredMarkets.map((marketItem, index) => (
+                <DropdownItem
+                  key={index}
+                  onClick={() => {
+                    setMarket(marketItem.code);
+                    setShowMarketDropdown(false);
+                  }}
+                >
+                  <span className="code">{marketItem.code}</span>
+                  <span className="name">- {marketItem.name}</span>
+                </DropdownItem>
+              ))
+            ) : (
+              <DropdownItem>No markets found</DropdownItem>
+            )}
+          </DropdownList>
+        )}
+      </ComboContainer>
+    );
+  };
+
+  const renderCodeCombo = () => {
+    // Filter codes by selected market if one is chosen
+    const relevantCodes = market 
+      ? availableCodes.filter(c => c.market === market)
+      : availableCodes;
+      
+    const filteredCodes = relevantCodes.filter(c => 
+      c.code.toLowerCase().includes(codeFilter.toLowerCase()) ||
+      c.name.toLowerCase().includes(codeFilter.toLowerCase())
+    );
+
+    return (
+      <ComboContainer>
+        <ComboInput
+          type="text"
+          value={code}
+          onChange={(e) => {
+            setCode(e.target.value);
+            setCodeFilter(e.target.value);
+            setShowCodeDropdown(true);
+          }}
+          onFocus={() => {
+            setCodeFilter(code);
+            setShowCodeDropdown(true);
+          }}
+          onBlur={() => {
+            // Delay hiding to allow click on dropdown items
+            setTimeout(() => setShowCodeDropdown(false), 150);
+          }}
+          placeholder="e.g., cu2401, i2401 or type to search..."
+        />
+        <ComboButton
+          type="button"
+          onClick={() => {
+            setCodeFilter('');
+            setShowCodeDropdown(!showCodeDropdown);
+          }}
+        >
+          ▼
+        </ComboButton>
+        {showCodeDropdown && (
+          <DropdownList>
+            {filteredCodes.length > 0 ? (
+              filteredCodes.slice(0, 50).map((codeItem, index) => ( // Limit to 50 items for performance
+                <DropdownItem
+                  key={index}
+                  onClick={() => {
+                    setCode(codeItem.code);
+                    setShowCodeDropdown(false);
+                  }}
+                >
+                  <span className="code">{codeItem.code}</span>
+                  <span className="name">- {codeItem.name}</span>
+                  {market !== codeItem.market && (
+                    <span className="name">({codeItem.market})</span>
+                  )}
+                </DropdownItem>
+              ))
+            ) : (
+              <DropdownItem>No codes found {market && `for ${market}`}</DropdownItem>
+            )}
+            {filteredCodes.length > 50 && (
+              <DropdownItem style={{fontStyle: 'italic', color: '#6c757d'}}>
+                Showing first 50 results... type to refine search
+              </DropdownItem>
+            )}
+          </DropdownList>
+        )}
+      </ComboContainer>
+    );
+  };
+
+  const renderHistoricalDataQuery = () => {
+    if (!selectedRevision) {
+      return (
+        <EmptyState>
+          Select a revision from the tree to configure historical data query
+        </EmptyState>
+      );
+    }
+
+    const meta = selectedRevision.fullMeta;
+    const fields = meta.fields || [];
+
+    const handleFieldToggle = (fieldName) => {
+      const newSelected = new Set(selectedFields);
+      if (newSelected.has(fieldName)) {
+        newSelected.delete(fieldName);
+      } else {
+        newSelected.add(fieldName);
+      }
+      setSelectedFields(newSelected);
+    };
+
+    const handleQuery = () => {
+      if (!market || !code || !fromTime || !toTime || selectedFields.size === 0) {
+        alert('Please fill in all required fields and select at least one field');
+        return;
+      }
+
+      setIsQuerying(true);
+      
+      // Convert datetime-local to timestamp
+      const fromTimestamp = Math.floor(new Date(fromTime).getTime() / 1000);
+      const toTimestamp = Math.floor(new Date(toTime).getTime() / 1000);
+      
+      const queryParams = {
+        market: market,
+        code: code,
+        fromTime: fromTimestamp,
+        toTime: toTimestamp,
+        granularity: parseInt(granularity),
+        fields: Array.from(selectedFields),
+        metaName: selectedRevision.metaName,
+        namespace: selectedRevision.namespaceKey
+      };
+
+      console.log('Executing historical data query:', queryParams);
+
+      // Send fetchByCode message to backend
+      sendMessage({
+        type: 'fetch_by_code',
+        ...queryParams
+      });
+
+      // Response will be handled by useEffect when fetch_by_code_response is received
+    };
+
+    // Pagination
+    const totalPages = Math.ceil(historicalData.length / itemsPerPage);
+    const startIndex = (currentPage - 1) * itemsPerPage;
+    const paginatedData = historicalData.slice(startIndex, startIndex + itemsPerPage);
+
+    return (
+      <QueryPanel>
+        <QuerySection>
+          <SectionTitle>Query Parameters</SectionTitle>
+          <FormRow>
+            <FormLabel>Market:</FormLabel>
+            {renderMarketCombo()}
+          </FormRow>
+          <FormRow>
+            <FormLabel>Code:</FormLabel>
+            {renderCodeCombo()}
+          </FormRow>
+          <FormRow>
+            <FormLabel>From Time:</FormLabel>
+            <FormInput 
+              type="datetime-local" 
+              value={fromTime} 
+              onChange={(e) => setFromTime(e.target.value)}
+            />
+          </FormRow>
+          <FormRow>
+            <FormLabel>To Time:</FormLabel>
+            <FormInput 
+              type="datetime-local" 
+              value={toTime} 
+              onChange={(e) => setToTime(e.target.value)}
+            />
+          </FormRow>
+          <FormRow>
+            <FormLabel>Granularity:</FormLabel>
+            <FormSelect value={granularity} onChange={(e) => setGranularity(e.target.value)}>
+              <option value="60">1 Minute (60s)</option>
+              <option value="300">5 Minutes (300s)</option>
+              <option value="900">15 Minutes (900s)</option>
+              <option value="3600">1 Hour (3600s)</option>
+              <option value="14400">4 Hours (14400s)</option>
+              <option value="86400">1 Day (86400s)</option>
+            </FormSelect>
+          </FormRow>
+        </QuerySection>
+
+        <QuerySection>
+          <SectionTitle>Field Selection ({selectedFields.size} selected)</SectionTitle>
+          <FieldSelector>
+            {fields.map((field, index) => (
+              <FieldOption key={index}>
+                <input 
+                  type="checkbox"
+                  checked={selectedFields.has(field.name)}
+                  onChange={() => handleFieldToggle(field.name)}
+                />
+                <strong>{field.name}</strong>
+                <span style={{ marginLeft: '8px', color: '#6c757d' }}>
+                  ({getTypeName(field.type)})
+                </span>
+              </FieldOption>
+            ))}
+          </FieldSelector>
+        </QuerySection>
+
+        <div>
+          <QueryButton 
+            onClick={handleQuery} 
+            disabled={isQuerying || selectedFields.size === 0}
+          >
+            {isQuerying ? 'Querying...' : 'Execute Query'}
+          </QueryButton>
+        </div>
+
+        {historicalData.length > 0 && (
+          <QuerySection>
+            <SectionTitle>Query Results ({historicalData.length} records)</SectionTitle>
+            <DataGrid>
+              <DataTable>
+                <thead>
+                  <tr>
+                    <DataHeader>Timestamp</DataHeader>
+                    <DataHeader>Row ID</DataHeader>
+                    {Array.from(selectedFields).map(field => (
+                      <DataHeader key={field}>{field}</DataHeader>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {paginatedData.map((record, index) => (
+                    <DataRow key={index}>
+                      <DataCell>{new Date(record.timestamp).toLocaleString()}</DataCell>
+                      <DataCell>{record.row_id}</DataCell>
+                      {Array.from(selectedFields).map(field => (
+                        <DataCell key={field}>
+                          {renderFieldValue(record[field])}
+                        </DataCell>
+                      ))}
+                    </DataRow>
+                  ))}
+                </tbody>
+              </DataTable>
+            </DataGrid>
+            
+            {totalPages > 1 && (
+              <div style={{ 
+                marginTop: '16px', 
+                display: 'flex', 
+                justifyContent: 'center', 
+                alignItems: 'center', 
+                gap: '8px' 
+              }}>
+                <button 
+                  onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+                  disabled={currentPage === 1}
+                  style={{ 
+                    padding: '6px 12px', 
+                    border: '1px solid #dee2e6', 
+                    background: currentPage === 1 ? '#f8f9fa' : 'white',
+                    cursor: currentPage === 1 ? 'not-allowed' : 'pointer'
+                  }}
+                >
+                  Previous
+                </button>
+                <span style={{ fontSize: '13px', color: '#6c757d' }}>
+                  Page {currentPage} of {totalPages} ({historicalData.length} total records)
+                </span>
+                <button 
+                  onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
+                  disabled={currentPage === totalPages}
+                  style={{ 
+                    padding: '6px 12px', 
+                    border: '1px solid #dee2e6', 
+                    background: currentPage === totalPages ? '#f8f9fa' : 'white',
+                    cursor: currentPage === totalPages ? 'not-allowed' : 'pointer'
+                  }}
+                >
+                  Next
+                </button>
+              </div>
+            )}
+          </QuerySection>
+        )}
+      </QueryPanel>
+    );
+  };
+
   if (!schema || Object.keys(schema).length === 0) {
     return (
       <Container>
@@ -450,15 +1268,23 @@ function SchemaViewer() {
       </TreePanel>
       
       <GridPanel>
-        <GridHeader>
-          {selectedRevision ? 
-            `Field Definitions - ${selectedRevision.metaName} (Rev ${selectedRevision.revision})` :
-            'Field Definitions'
-          }
-        </GridHeader>
-        <GridContent>
-          {renderFieldGrid()}
-        </GridContent>
+        <TabContainer>
+          <Tab 
+            $active={activeTab === 'fields'} 
+            onClick={() => setActiveTab('fields')}
+          >
+            Field Definitions
+          </Tab>
+          <Tab 
+            $active={activeTab === 'historical'} 
+            onClick={() => setActiveTab('historical')}
+          >
+            Historical Data Query
+          </Tab>
+        </TabContainer>
+        <TabContent>
+          {activeTab === 'fields' ? renderFieldGrid() : renderHistoricalDataQuery()}
+        </TabContent>
       </GridPanel>
     </Container>
   );

@@ -263,17 +263,20 @@ class ClientHandler {
     });
     
     // Send existing schema and market data if available
-    if (this.wasmService.getSchema()) {
+    const sharedSchema = this.caitlynService.getSharedSchema();
+    const sharedMarkets = this.caitlynService.getSharedMarkets();
+    
+    if (sharedSchema && Object.keys(sharedSchema).length > 0) {
       this.sendToFrontend({
         type: 'schema_received',
-        data: this.wasmService.getSchema()
+        data: sharedSchema
       });
     }
     
-    if (this.wasmService.getMarkets()) {
+    if (sharedMarkets && Object.keys(sharedMarkets).length > 0) {
       this.sendToFrontend({
         type: 'markets_received',
-        data: this.wasmService.getMarkets()
+        data: sharedMarkets
       });
     }
     
@@ -321,7 +324,7 @@ class ClientHandler {
     logger.info('Testing universe revision functionality...');
     
     // Use already loaded market data from shared service
-    const marketsData = this.wasmService.getMarkets();
+    const marketsData = this.caitlynService.getSharedMarkets();
     if (!marketsData) {
       logger.warn('No markets data available yet - shared pool may still be fetching data');
       return {

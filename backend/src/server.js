@@ -37,6 +37,67 @@ const poolConfig = {
 
 const caitlynService = new CaitlynWebSocketService(poolConfig);
 
+// Helper function to generate mock historical data for fetch_by_code requests
+function generateMockHistoricalData(market, code, fromTime, toTime, granularity, fields = []) {
+  const interval = granularity * 1000; // granularity is in seconds
+  const mockRecords = [];
+  
+  let currentTime = fromTime * 1000; // Convert to milliseconds
+  const endTime = toTime * 1000;
+  let basePrice = 3000 + Math.random() * 200;
+  
+  // Create field definitions from provided fields
+  const fieldDefs = fields.map(fieldName => ({ name: fieldName, type: 'number' }));
+  
+  while (currentTime <= endTime && mockRecords.length < 100) {
+    const record = {};
+    
+    // Generate data for each requested field
+    fieldDefs.forEach(field => {
+      const fieldName = field.name;
+      const lowerFieldName = fieldName.toLowerCase();
+      
+      // Generate realistic data based on field patterns
+      if (lowerFieldName.includes('price') || lowerFieldName.includes('close') || lowerFieldName.includes('open')) {
+        record[fieldName] = parseFloat((basePrice + (Math.random() - 0.5) * 50).toFixed(4));
+      } else if (lowerFieldName.includes('high')) {
+        record[fieldName] = parseFloat((basePrice + Math.random() * 25).toFixed(4));
+      } else if (lowerFieldName.includes('low')) {
+        record[fieldName] = parseFloat((basePrice - Math.random() * 25).toFixed(4));
+      } else if (lowerFieldName.includes('volume')) {
+        record[fieldName] = Math.floor(Math.random() * 50000) + 5000;
+      } else if (lowerFieldName.includes('forecast')) {
+        record[fieldName] = parseFloat((Math.random() * 100).toFixed(4));
+      } else if (lowerFieldName.includes('confidence')) {
+        record[fieldName] = parseFloat((Math.random() * 1).toFixed(4));
+      } else {
+        // Generic numeric data
+        record[fieldName] = parseFloat((Math.random() * 1000).toFixed(4));
+      }
+    });
+    
+    // Always include basic identifiers
+    record.timestamp = currentTime / 1000; // Convert back to seconds
+    record.datetime = new Date(currentTime).toISOString();
+    record.market = market;
+    record.code = code;
+    
+    mockRecords.push(record);
+    
+    currentTime += interval;
+    basePrice += (Math.random() - 0.5) * 2; // Slight drift
+  }
+  
+  return {
+    records: mockRecords,
+    totalCount: mockRecords.length,
+    processingTime: new Date().toISOString(),
+    source: 'backend_mock_data',
+    fieldCount: fieldDefs.length,
+    message: `Generated ${mockRecords.length} mock records for ${market}/${code}`
+  };
+}
+
 // Helper function to generate mock historical data on server side
 function generateServerMockData(params) {
   const { market, code, metaID, namespace, metaName, granularity, startTime, endTime, fieldIndices } = params;
@@ -471,6 +532,75 @@ wss.on('connection', (ws, req) => {
         }));
         break;
         
+      case 'fetch_by_code':
+        // Handle fetch by code request from SchemaViewer
+        try {
+          const { market, code, fromTime, toTime, granularity, fields, metaName, namespace, revision } = data;
+          
+          logger.info(`📊 Fetch by code request: ${market}/${code} from ${fromTime} to ${toTime}`);
+          logger.info('🔍 RAW Frontend Parameters:');
+          logger.info(`   market: "${market}" (type: ${typeof market})`);
+          logger.info(`   code: "${code}" (type: ${typeof code})`);
+          logger.info(`   fromTime: ${fromTime} (type: ${typeof fromTime})`);
+          logger.info(`   toTime: ${toTime} (type: ${typeof toTime})`);
+          logger.info(`   granularity: ${granularity} (type: ${typeof granularity})`);
+          logger.info(`   fields: [${fields?.map(f => `"${f}"`).join(', ') || 'none'}] (${fields?.length || 0} total)`);
+          logger.info(`   metaName: "${metaName}" (type: ${typeof metaName})`);
+          logger.info(`   namespace: "${namespace}" (type: ${typeof namespace})`);
+          logger.info(`   revision: ${revision} (type: ${typeof revision})`);
+          
+          // Use the same format as working test_connection.js
+          // qualifiedName should be just the metaName (e.g., 'SampleQuote')
+          // namespace should be the string format (e.g., 'global', 'private')
+          const qualifiedName = metaName;
+          const namespaceString = namespace === '0' ? 'global' : namespace === '1' ? 'private' : `namespace_${namespace}`;
+          
+          logger.info(`🏗️ Using test_connection.js format:`);
+          logger.info(`   qualifiedName: "${qualifiedName}" (just metaName, no namespace prefix)`);
+          logger.info(`   namespace: "${namespaceString}" (string format, not integer)`);
+          logger.info(`   revision: ${revision !== undefined ? parseInt(revision) : -1} (${revision !== undefined ? 'from frontend' : 'default -1'})`);
+          
+          // Call the fetchHistoricalData method with correct format
+          const options = {
+            fromTime,
+            toTime, 
+            granularity,
+            fields,
+            qualifiedName,
+            namespace: namespaceString,  // Use string format like test_connection.js
+            revision: revision !== undefined ? parseInt(revision) : -1,  // Pass revision parameter, default to -1
+            timeout: 30000
+          };
+          
+          logger.info('🔍 Options passed to fetchHistoricalData:', JSON.stringify(options, null, 2));
+          
+          const result = await caitlynService.fetchHistoricalData(market, code, options);
+          
+          ws.send(JSON.stringify({
+            type: 'fetch_by_code_response',
+            success: true,
+            data: result,
+            message: `Historical data fetched successfully for ${market}/${code}`,
+            queryParams: { market, code, fromTime, toTime, granularity, fieldCount: fields?.length }
+          }));
+          
+        } catch (error) {
+          logger.error('Error in fetch_by_code:', error);
+          
+          // Send error response to frontend instead of crashing
+          ws.send(JSON.stringify({
+            type: 'fetch_by_code_response',
+            success: false,
+            message: error.message,
+            error: {
+              type: error.name,
+              message: error.message,
+              stack: error.stack
+            }
+          }));
+        }
+        break;
+        
       default:
         logger.warn('Unknown message type:', data.type);
     }
@@ -507,11 +637,16 @@ async function initialize() {
     // Initialize the enhanced connection pool with WASM paths
     await caitlynService.initializePoolOnce(caitlynUrl, caitlynToken, wasmJsPath, wasmPath);
     logger.info('✅ Enhanced connection pool initialized successfully');
+    logger.info('⏳ Waiting for universe initialization to complete before starting server...');
     
-    const PORT = process.env.PORT || 4000;
-    server.listen(PORT, () => {
-      logger.info(`✅ Backend server ready on port ${PORT} with enhanced Caitlyn connection pool`);
+    // Wait for pool_ready event before starting the server
+    caitlynService.connectionPool.once('pool_ready', () => {
+      const PORT = process.env.PORT || 4000;
+      server.listen(PORT, () => {
+        logger.info(`✅ Backend server ready on port ${PORT} - universe fully initialized!`);
+      });
     });
+    
   } catch (error) {
     logger.error('❌ Failed to initialize enhanced connection pool:', error);
     process.exit(1);

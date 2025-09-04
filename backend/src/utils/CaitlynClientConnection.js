@@ -16,6 +16,7 @@
  */
 
 import ws from 'nodejs-websocket';
+import path from 'path';
 import { createSingularityObject } from './SingularityObjects.js';
 import SVObject from './StructValueWrapper.js';
 
@@ -30,6 +31,7 @@ class CaitlynClientConnection {
     this.wsClient = null;
     this.isConnected = false;
     this.isInitialized = false;
+    this.isDisconnecting = false;
     
     // WASM module and processing
     this.wasmModule = null;
@@ -67,15 +69,25 @@ class CaitlynClientConnection {
    * @param {string} wasmJsPath - Path to caitlyn_js.js
    * @param {string} wasmPath - Path to caitlyn_js.wasm
    */
-  async loadWasmModule(wasmJsPath = '../public/caitlyn_js.js', wasmPath = '../public/caitlyn_js.wasm') {
+  async loadWasmModule(wasmJsPath = './public/caitlyn_js.js', wasmPath = './public/caitlyn_js.wasm') {
     try {
       this.logger.info('🔧 Loading WASM module...');
       
-      // Dynamic import for ES modules with path resolution
-      const resolvedPath = wasmJsPath.startsWith('/') ? wasmJsPath : 
-                          wasmJsPath.startsWith('.') ? 
-                          new URL(wasmJsPath, import.meta.url).pathname : 
-                          wasmJsPath;
+      // Dynamic import for ES modules with proper path resolution
+      // Convert relative paths to absolute paths based on project root
+      let resolvedPath;
+      if (wasmJsPath.startsWith('/')) {
+        // Absolute path
+        resolvedPath = wasmJsPath;
+      } else if (wasmJsPath.startsWith('.')) {
+        // Relative path - resolve from project root
+        resolvedPath = path.resolve(process.cwd(), wasmJsPath);
+      } else {
+        // Bare path
+        resolvedPath = wasmJsPath;
+      }
+      
+      this.logger.debug(`Resolving WASM path: ${wasmJsPath} -> ${resolvedPath}`);
       const CaitlynModule = await import(resolvedPath);
       this.wasmModule = await CaitlynModule.default();
       
@@ -146,7 +158,11 @@ class CaitlynClientConnection {
       this.wsClient.on("close", () => {
         this.logger.info("🔌 WebSocket connection closed");
         this.isConnected = false;
-        this.emit('disconnected');
+        
+        // Only emit disconnected if we're not already in disconnect process
+        if (!this.isDisconnecting) {
+          this.emit('disconnected');
+        }
       });
     });
   }
@@ -613,16 +629,39 @@ class CaitlynClientConnection {
     res.setCompressor(this.compressor);
     res.decode(pkg.content());
     
+    this.logger.info(`🔍 Response decode completed, checking results availability...`);
+    this.logger.info(`🔍 Response seq: ${res.seq}`);
+    this.logger.info(`🔍 Response status: ${res.status}`);
+    this.logger.info(`🔍 Response errorCode: ${res.errorCode}`);
+    this.logger.info(`🔍 Response errorMsg: ${res.errorMsg}`);
+    
+    // Find cached query info by sequence ID
+    const responseSeq = res.seq;
+    const queryInfo = this.queryCache.get(responseSeq);
+    
+    if (!queryInfo) {
+      this.logger.error(`❌ No cached query info found for seq=${responseSeq}`);
+      res.delete();
+      return;
+    }
+    
+    // Check if the response indicates an error
+    // A successful response typically has status 0 and errorCode 0
+    if (res.errorCode !== 0) {
+      this.logger.error(`❌ Server returned error response: ${res.errorMsg} (code: ${res.errorCode})`);
+      if (queryInfo.reject) {
+        queryInfo.reject(new Error(`Server error: ${res.errorMsg} (code: ${res.errorCode})`));
+      }
+      res.delete();
+      this.queryCache.delete(responseSeq);
+      return;
+    }
+    
+    this.logger.info(`🔍 Attempting to access results...`);
     const results = res.results();
     const resultCount = results.size();
     
     this.logger.info(`📦 Received ${resultCount} StructValues from server`);
-    
-    // Find cached query info by sequence ID - let it crash if not found
-    const responseSeq = res.seq;
-    const queryInfo = this.queryCache.get(responseSeq);
-    
-    this.logger.info(`🔍 Using cached query info for seq=${responseSeq}`);
     this.logger.info(`🔍 Using cached query info for seq=${responseSeq}: ${queryInfo.qualifiedName}`);
     
     const records = [];
@@ -641,7 +680,7 @@ class CaitlynClientConnection {
       
       svObject.loadDefFromDict(this.schemaByNamespace);
       
-      const maxDisplay = Math.min(5, resultCount);
+      const maxDisplay = resultCount; // Process all records instead of limiting to 5
       
       for (let i = 0; i < maxDisplay; i++) {
         const sv = results.get(i);
@@ -650,12 +689,25 @@ class CaitlynClientConnection {
           // Process with configured SVObject - let it crash if issues
           svObject.fromSv(sv);
           const objectData = svObject.toJSON();
-          const fields = objectData.fields || {};
+          const allFields = objectData.fields || {};
+          
+          // Filter to only return requested fields
+          const fields = {};
+          if (queryInfo.fields && Array.isArray(queryInfo.fields)) {
+            for (const requestedField of queryInfo.fields) {
+              if (allFields.hasOwnProperty(requestedField)) {
+                fields[requestedField] = allFields[requestedField];
+              }
+            }
+          } else {
+            // If no fields specified, return all fields (backward compatibility)
+            Object.assign(fields, allFields);
+          }
           
           const record = {
             market: svObject.market || 'unknown',
             code: svObject.code || 'unknown',
-            timestamp: svObject.timetag || 0,
+            timestamp: svObject.timetag ? String(svObject.timetag) : '0', // Keep as string (milliseconds)
             metaID: sv.metaID,
             namespace: sv.namespace,
             metaName: queryInfo.qualifiedName,
@@ -680,7 +732,7 @@ class CaitlynClientConnection {
           records.push({
             market: sv.market || 'unknown',
             code: sv.stockCode || 'unknown',
-            timestamp: sv.timeTag || 0,
+            timestamp: sv.timeTag ? String(sv.timeTag) : '0',
             metaID: sv.metaID,
             namespace: sv.namespace,
             error: e.message,
@@ -707,15 +759,29 @@ class CaitlynClientConnection {
     
     res.delete();
     
+    // Resolve the Promise with the decoded records
+    if (queryInfo.resolve) {
+      queryInfo.resolve({
+        records: records,
+        count: resultCount,
+        qualifiedName: queryInfo.qualifiedName,
+        market: queryInfo.market,
+        code: queryInfo.code,
+        success: true
+      });
+    }
+    
     // Clean up query cache entry
     this.queryCache.delete(responseSeq);
     this.logger.debug(`🗑️ Cleaned up query cache for seq=${responseSeq}`);
     
+    // Also emit event for backward compatibility
     this.emit('historical_data', { records, count: resultCount });
   }
 
   /**
    * Generic fetch by code method - works with any metadata type
+   * Returns Promise that resolves with decoded SVObject instances
    */
   async fetchByCode(market, code, options = {}) {
     if (!this.isInitialized) {
@@ -724,13 +790,17 @@ class CaitlynClientConnection {
     
     const {
       qualifiedName,
-      namespace = 'global',
+      namespace = 0,  // 0 for global, 1 for private
       granularity = 86400,
-      fromDate = new Date('2025-01-01'),
-      toDate = new Date('2025-08-01'),
+      fromTime,
+      toTime,
       fields = [],
-      revision = -1
+      revision = -1  // Support revision parameter
     } = options;
+    
+    // Convert Unix timestamps (seconds) to Date objects for logging
+    const fromDate = fromTime ? new Date(fromTime * 1000) : new Date('2025-01-01');
+    const toDate = toTime ? new Date(toTime * 1000) : new Date('2025-08-01');
     
     if (!qualifiedName) {
       throw new Error('qualifiedName is required for generic fetch operations');
@@ -740,61 +810,92 @@ class CaitlynClientConnection {
     
     this.logger.info(`📤 Generic fetch request: ${market}/${code} (${qualifiedName}) seq=${currentSeqId}`);
     
-    // Cache query parameters for async response processing
-    const queryInfo = {
-      type: 'fetchByCode',
-      market: market,
-      code: code,
-      qualifiedName: qualifiedName,
-      namespace: namespace,
-      granularity: granularity,
-      fromDate: fromDate,
-      toDate: toDate,
-      fields: fields,
-      revision: revision,
-      timestamp: Date.now()
-    };
-    
-    this.queryCache.set(currentSeqId, queryInfo);
-    this.logger.info(`💾 Cached query parameters for seq=${currentSeqId}`);
-    
-    // Create ATFetchByCode request
-    const fetchByCodeReq = new this.wasmModule.ATFetchByCodeReq();
-    
-    fetchByCodeReq.token = this.token;
-    fetchByCodeReq.seq = currentSeqId;
-    fetchByCodeReq.namespace = namespace;
-    fetchByCodeReq.qualifiedName = qualifiedName;
-    fetchByCodeReq.revision = revision;
-    fetchByCodeReq.market = market;
-    fetchByCodeReq.code = code;
-    fetchByCodeReq.granularity = granularity;
-    
-    // Set fields if provided
-    const fieldsVector = new this.wasmModule.StringVector();
-    if (fields && fields.length > 0) {
-      fields.forEach(field => fieldsVector.push_back(field));
-    }
-    fetchByCodeReq.fields = fieldsVector;
-    
-    // Set time range
-    fetchByCodeReq.fromTimeTag = fromDate.getTime().toString();
-    fetchByCodeReq.toTimeTag = toDate.getTime().toString();
-    
-    // Encode and send
-    const pkg = new this.wasmModule.NetPackage();
-    const encodedMsg = pkg.encode(this.wasmModule.CMD_AT_FETCH_BY_CODE, fetchByCodeReq.encode());
-    const msgBuffer = Buffer.from(encodedMsg);
-    
-    this.wsClient.sendBinary(msgBuffer);
-    this.logger.info(`✅ Generic fetch request sent: ${qualifiedName} (seq=${currentSeqId})`);
-    
-    // Cleanup
-    fetchByCodeReq.delete();
-    pkg.delete();
-    fieldsVector.delete();
-    
-    return true;
+    // Return Promise that resolves when response is received
+    return new Promise((resolve, reject) => {
+      // Cache query parameters AND Promise resolver for async response processing
+      const queryInfo = {
+        type: 'fetchByCode',
+        market: market,
+        code: code,
+        qualifiedName: qualifiedName,
+        namespace: namespace,
+        granularity: granularity,
+        fromDate: fromDate,
+        toDate: toDate,
+        fields: fields,
+        revision: revision,
+        timestamp: Date.now(),
+        resolve: resolve,  // Store Promise resolver
+        reject: reject    // Store Promise rejector
+      };
+      
+      this.queryCache.set(currentSeqId, queryInfo);
+      this.logger.info(`💾 Cached query parameters for seq=${currentSeqId}`);
+      
+      try {
+        // Create ATFetchByCode request
+        const fetchByCodeReq = new this.wasmModule.ATFetchByCodeReq();
+        
+        this.logger.info(`🔍 ATFetchByCodeReq Parameters:`);
+        this.logger.info(`   token: "${this.token}"`);
+        this.logger.info(`   seq: ${currentSeqId}`);
+        this.logger.info(`   namespace: "${namespace}"`);
+        this.logger.info(`   qualifiedName: "${qualifiedName}"`);
+        this.logger.info(`   revision: ${revision}`);
+        this.logger.info(`   market: "${market}"`);
+        this.logger.info(`   code: "${code}"`);
+        this.logger.info(`   granularity: ${granularity}`);
+        this.logger.info(`   fromDate: ${fromDate.toISOString()} (${fromDate.getTime()})`);
+        this.logger.info(`   toDate: ${toDate.toISOString()} (${toDate.getTime()})`);
+        this.logger.info(`   fields: [${fields.map(f => `"${f}"`).join(', ')}] (${fields.length} total)`);
+        
+        fetchByCodeReq.token = this.token;
+        fetchByCodeReq.seq = currentSeqId;
+        fetchByCodeReq.namespace = namespace.toString();  // Convert integer to string for WASM
+        fetchByCodeReq.qualifiedName = qualifiedName;
+        fetchByCodeReq.revision = revision;
+        fetchByCodeReq.market = market;
+        fetchByCodeReq.code = code;
+        fetchByCodeReq.granularity = granularity;
+        
+        // Set fields if provided
+        const fieldsVector = new this.wasmModule.StringVector();
+        if (fields && fields.length > 0) {
+          fields.forEach((field, index) => {
+            this.logger.info(`   Adding field[${index}]: "${field}"`);
+            fieldsVector.push_back(field);
+          });
+        }
+        fetchByCodeReq.fields = fieldsVector;
+        
+        // Set time range - Use Unix timestamps converted to milliseconds as strings
+        const fromTimeTag = fromTime ? (fromTime * 1000).toString() : fromDate.getTime().toString();
+        const toTimeTag = toTime ? (toTime * 1000).toString() : toDate.getTime().toString();
+        this.logger.info(`   fromTimeTag: "${fromTimeTag}" (from Unix ${fromTime})`);
+        this.logger.info(`   toTimeTag: "${toTimeTag}" (from Unix ${toTime})`);
+        
+        fetchByCodeReq.fromTimeTag = fromTimeTag;
+        fetchByCodeReq.toTimeTag = toTimeTag;
+        
+        // Encode and send
+        const pkg = new this.wasmModule.NetPackage();
+        const encodedMsg = pkg.encode(this.wasmModule.CMD_AT_FETCH_BY_CODE, fetchByCodeReq.encode());
+        const msgBuffer = Buffer.from(encodedMsg);
+        
+        this.wsClient.sendBinary(msgBuffer);
+        this.logger.info(`✅ Generic fetch request sent: ${qualifiedName} (seq=${currentSeqId})`);
+        
+        // Cleanup
+        fetchByCodeReq.delete();
+        pkg.delete();
+        fieldsVector.delete();
+        
+      } catch (error) {
+        this.logger.error(`❌ Error sending fetch request: ${error.message}`);
+        this.queryCache.delete(currentSeqId);
+        reject(error);
+      }
+    });
   }
 
   /**
@@ -940,6 +1041,14 @@ class CaitlynClientConnection {
    * Disconnect from server
    */
   disconnect() {
+    // Prevent recursive disconnect calls
+    if (this.isDisconnecting) {
+      return;
+    }
+    
+    this.isDisconnecting = true;
+    this.logger.debug('🔌 Starting disconnect process...');
+    
     if (this.wsClient) {
       this.wsClient.close();
       this.wsClient = null;
@@ -952,6 +1061,8 @@ class CaitlynClientConnection {
       this.compressor.delete();
       this.compressor = null;
     }
+    
+    this.logger.debug('✅ Disconnect process completed');
   }
 
   /**
