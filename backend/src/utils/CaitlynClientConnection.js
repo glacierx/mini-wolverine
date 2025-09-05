@@ -19,6 +19,7 @@ import ws from 'nodejs-websocket';
 import path from 'path';
 import { createSingularityObject } from './SingularityObjects.js';
 import SVObject from './StructValueWrapper.js';
+import CaitlynSubscriptionHub from './CaitlynSubscriptionHub.js';
 
 class CaitlynClientConnection {
   constructor(options = {}) {
@@ -51,6 +52,13 @@ class CaitlynClientConnection {
     // Async query cache for tracking request-response mapping
     this.queryCache = new Map(); // Map<sequenceId, queryInfo>
     
+    // Real-time subscription management
+    this.subscriptions = new Map(); // Map<subscriptionKey, subscriptionInfo>
+    this.subscriptionCallbacks = new Map(); // Map<subscriptionKey, callback>
+    
+    // Enhanced subscription hub (optional, for deduplication and optimization)
+    this.subscriptionHub = options.useSubscriptionHub !== false ? new CaitlynSubscriptionHub(this, this.logger) : null;
+    
     // Event handlers
     this.eventHandlers = {
       'connected': [],
@@ -60,7 +68,8 @@ class CaitlynClientConnection {
       'seeds_loaded': [],
       'message': [],
       'error': [],
-      'disconnected': []
+      'disconnected': [],
+      'real_time_data': [] // Add real-time data event
     };
   }
 
@@ -98,7 +107,9 @@ class CaitlynClientConnection {
         'NetPackage', 'IndexSerializer', 'IndexSchema', 
         'ATUniverseReq', 'ATUniverseRes', 
         'ATUniverseSeedsReq', 'ATUniverseSeedsRes',
-        'ATFetchByCodeReq', 'ATFetchSVRes'
+        'ATFetchByCodeReq', 'ATFetchSVRes',
+        'ATSubscribeReq', 'ATSubscribeRes', 'ATUnsubscribeReq',
+        'ATSubscribeSVRes', 'ATSubscribeOrderRes', 'StringVector', 'StringMatrix', 'Uint32Vector', 'Uint8Vector'
       ];
       
       for (const className of requiredClasses) {
@@ -195,7 +206,7 @@ class CaitlynClientConnection {
           // Log non-keepalive messages
           if (pkg.header.cmd !== this.wasmModule.NET_CMD_GOLD_ROUTE_KEEPALIVE && 
               pkg.header.cmd !== this.wasmModule.CMD_TA_MARKET_STATUS) {
-            this.logger.info(`📦 Message: cmd=${pkg.header.cmd}, content_len=${pkg.length()}`);
+            this.logger.info(`📦 Message: cmd=${this.getCommandName(pkg.header.cmd)} (${pkg.header.cmd}), content_len=${pkg.length()}`);
           }
           
           // Route messages
@@ -242,12 +253,35 @@ class CaitlynClientConnection {
         this.handleFetchByCodeResponse(pkg);
         break;
         
+      case this.wasmModule.CMD_AT_SUBSCRIBE:
+        this.handleSubscriptionConfirmation(pkg);  // ATSubscribeRes
+        break;
+        
+      case this.wasmModule.CMD_AT_UNSUBSCRIBE:
+        this.handleUnsubscriptionResponse(pkg);
+        break;
+                
+      case this.wasmModule.CMD_AT_SUBSCRIBE_SORT:
+        this.handleSubscriptionData(pkg);  // ATSubscribeSVRes - the actual data
+        break;
+        
+      case this.wasmModule.CMD_TA_SUBSCRIBE_HEADER:
+        this.logger.info(`📦 Received ${this.getCommandName(this.wasmModule.CMD_TA_SUBSCRIBE_HEADER)}`);
+        this.handleSubscriptionHeader(pkg);  // ATSubscribeOrderRes
+        break;
+        
       case this.wasmModule.CMD_TA_MARKET_STATUS:
         // Market status - ignore for now
         break;
-        
+      case this.wasmModule.CMD_TA_PUSH_DATA:
+        // Check if this might be real-time market data
+        this.handlePotentialRealTimeData(pkg);
+        break;
       default:
-        this.logger.debug(`❓ Unhandled command: ${cmd}`);
+        this.logger.debug(`❓ Unhandled command: ${this.getCommandName(cmd)} (${cmd})`);
+        let errRes = new this.wasmModule.ATBaseResponse()
+        errRes.decode(pkg.content());
+        this.logger.warn(`⚠️ Unhandled message: cmd=${this.getCommandName(cmd)} (${cmd}), status=${errRes.status}, errorCode=${errRes.errorCode}, errorMsg=${errRes.errorMsg}`);
         break;
     }
   }
@@ -375,7 +409,7 @@ class CaitlynClientConnection {
     const msg = Buffer.from(pkg.encode(this.wasmModule.CMD_AT_UNIVERSE_REV, revReq.encode()));
     
     this.wsClient.sendBinary(msg);
-    this.logger.info("✅ Universe revision request sent");
+    this.logger.info(`✅ ${this.getCommandName(this.wasmModule.CMD_AT_UNIVERSE_REV)} sent`);
     
     // Cleanup
     revReq.delete();
@@ -520,6 +554,8 @@ class CaitlynClientConnection {
             
             this.wsClient.sendBinary(msg);
             requestsSent++;
+            
+            this.logger.debug(`📤 Sent ${this.getCommandName(this.wasmModule.CMD_AT_UNIVERSE_SEEDS)} for ${marketCode}::${qualifiedName}`);
             
             // Cleanup
             seedsReq.delete();
@@ -780,6 +816,561 @@ class CaitlynClientConnection {
   }
 
   /**
+   * Handle subscription response (ATSubscribeRes)
+   */
+  handleSubscriptionResponse(pkg) {
+    const subscribeRes = new this.wasmModule.ATSubscribeRes();
+    subscribeRes.decode(pkg.content());
+    
+    this.logger.info('📡 ===== SUBSCRIPTION RESPONSE =====');
+    this.logger.info(`🆔 UUID: ${subscribeRes.UUID}`);
+    this.logger.info(`✅ Status: ${subscribeRes.status}`);
+    
+    // UUID verification - Check if server UUID exists in local subscriptions
+    const serverUUID = subscribeRes.UUID;
+    let foundSubscription = null;
+    let subscriptionKey = null;
+    
+    for (const [key, info] of this.subscriptions.entries()) {
+      if (info.uuid === serverUUID) {
+        foundSubscription = info;
+        subscriptionKey = key;
+        break;
+      }
+    }
+    
+    if (!foundSubscription) {
+      this.logger.error(`❌ UUID VERIFICATION FAILED: Server returned UUID ${serverUUID} which does not exist in local subscriptions`);
+      this.logger.error(`   📋 Local subscription UUIDs: ${Array.from(this.subscriptions.values()).map(s => s.uuid).join(', ')}`);
+      subscribeRes.delete();
+      return;
+    }
+    
+    this.logger.info(`✅ UUID verification passed: ${serverUUID} matches local subscription for ${subscriptionKey}`);
+    
+    if (subscribeRes.status !== 0) {
+      this.logger.error(`❌ Subscription failed: ${subscribeRes.errorMsg}`);
+      foundSubscription.confirmed = false;
+      foundSubscription.error = subscribeRes.errorMsg;
+    } else {
+      this.logger.info('🎯 Subscription established successfully');
+      foundSubscription.confirmed = true;
+    }
+    
+    foundSubscription.confirmedAt = new Date();
+    foundSubscription.serverStatus = subscribeRes.status;
+    
+    subscribeRes.delete();
+  }
+
+  /**
+   * Handle unsubscription response
+   */
+  handleUnsubscriptionResponse(pkg) {
+    // ATUnsubscribeReq doesn't have a specific response class, just log success
+    this.logger.info('📡 ===== UNSUBSCRIPTION RESPONSE =====');
+    this.logger.info('✅ Unsubscription confirmed');
+  }
+
+  /**
+   * Handle real-time subscription data (ATSubscribeSVRes)
+   */
+  handleRealTimeSubscriptionData(pkg) {
+    const realTimeRes = new this.wasmModule.ATSubscribeSVRes();
+    realTimeRes.setCompressor(this.compressor);
+    realTimeRes.decode(pkg.content());
+    
+    const structValues = realTimeRes.values();
+    const fieldCount = realTimeRes.fields ? realTimeRes.fields.length : 0;
+    
+    this.logger.info('📡 ===== REAL-TIME SUBSCRIPTION DATA =====');
+    this.logger.info(`📊 Received ${structValues.size()} StructValues`);
+    this.logger.info(`🏷️ Fields: ${fieldCount}`);
+    
+    // Process each StructValue and match to subscriptions
+    for (let i = 0; i < structValues.size(); i++) {
+      const sv = structValues.get(i);
+      this.processRealTimeDataForSubscription(sv);
+    }
+    
+    realTimeRes.delete();
+  }
+
+  /**
+   * Process individual StructValue for subscription matching
+   */
+  processRealTimeDataForSubscription(sv) {
+    // Extract metadata
+    const metaID = sv.metaID;
+    const namespace = sv.namespace;
+    
+    // Find meta information
+    const meta = this.schemaByNamespace[namespace]?.[metaID];
+    if (!meta) {
+      this.logger.debug(`⚠️ Meta not found: ID=${metaID}, namespace=${namespace}`);
+      return;
+    }
+    
+    const qualifiedName = meta.name;
+    const namespaceStr = namespace === 0 ? 'global' : 'private';
+    
+    // Extract market/code information from the StructValue
+    let market = 'unknown';
+    let code = 'unknown';
+    
+    // Use SVObject to extract data
+    const svObject = createSingularityObject(qualifiedName, this.wasmModule);
+    if (svObject) {
+      svObject.loadDefFromDict(this.schemaByNamespace);
+      svObject.fromSv(sv);
+      const data = svObject.toJSON();
+      
+      // Extract market/code from common field patterns
+      market = data.fields.market || data.fields.marketCode || 'unknown';
+      code = data.fields.code || data.fields.symbol || data.fields.stockCode || 'unknown';
+      
+      // Match against active subscriptions
+      for (const [subscriptionKey, subscriptionInfo] of this.subscriptions.entries()) {
+        if (subscriptionInfo.active &&
+            subscriptionInfo.market === market &&
+            subscriptionInfo.code === code &&
+            subscriptionInfo.qualifiedName === qualifiedName &&
+            subscriptionInfo.namespace === namespaceStr) {
+          
+          // Call subscription callback
+          const callback = this.subscriptionCallbacks.get(subscriptionKey);
+          if (callback) {
+            const realTimeRecord = {
+              subscriptionKey,
+              market,
+              code,
+              qualifiedName,
+              namespace: namespaceStr,
+              timestamp: Date.now(),
+              fields: data.fields
+            };
+            
+            callback(realTimeRecord);
+            this.logger.debug(`📡 Delivered real-time data to subscription: ${subscriptionKey}`);
+          }
+        }
+      }
+      
+      svObject.cleanup();
+    }
+  }
+
+  /**
+   * Handle subscription confirmation using ATSubscribeRes
+   */
+  handleSubscriptionConfirmation(pkg) {
+    try {
+      this.logger.info(`📦 Processing subscription confirmation, content length: ${pkg.content().length} bytes`);
+      
+      const res = new this.wasmModule.ATSubscribeRes();
+      res.decode(pkg.content());
+
+      this.logger.info(`🔍 Subscription confirmation - errorCode: ${res.errorCode}`);
+      this.logger.info(`🔍 Subscription confirmation - errorMsg: ${res.errorMsg}`);
+
+      if (res.errorCode !== 0) {
+        this.logger.error(`❌ Subscription error: ${res.errorMsg} (code: ${res.errorCode})`);
+        res.delete();
+        return;
+      }
+
+      this.logger.info(`✅ Subscription confirmed successfully`);
+      res.delete();
+      
+    } catch (error) {
+      this.logger.error('Error handling subscription confirmation:', error);
+    }
+  }
+
+  /**
+   * Handle subscription header using ATSubscribeOrderRes
+   */
+  handleSubscriptionHeader(pkg) {
+    try {
+      this.logger.info(`📦 Processing subscription header, content length: ${pkg.content().length} bytes`);
+      
+      const res = new this.wasmModule.ATSubscribeOrderRes();
+      res.decode(pkg.content());
+
+      this.logger.info(`🔍 Subscription header - errorCode: ${res.errorCode}`);
+      this.logger.info(`🔍 Subscription header - errorMsg: ${res.errorMsg}`);
+
+      if (res.errorCode !== 0) {
+        this.logger.error(`❌ Subscription header error: ${res.errorMsg} (code: ${res.errorCode})`);
+        res.delete();
+        return;
+      }
+
+      this.logger.info(`✅ Subscription header processed successfully`);
+      
+      // The header typically contains metadata about the subscription stream
+      // For now, just log success - actual data will come in subsequent messages
+      
+      res.delete();
+      
+    } catch (error) {
+      this.logger.error('Error handling subscription header:', error);
+    }
+  }
+
+  /**
+   * Handle subscription data using ATSubscribeSVRes (the actual data)
+   */
+  handleSubscriptionData(pkg) {
+    try {
+      this.logger.info(`📦 Processing subscription data, content length: ${pkg.content().length} bytes`);
+      
+      const res = new this.wasmModule.ATSubscribeSVRes();
+      res.setCompressor(this.compressor);
+      res.decode(pkg.content());
+
+      this.logger.info(`🔍 Subscription data - errorCode: ${res.errorCode}`);
+      this.logger.info(`🔍 Subscription data - errorMsg: ${res.errorMsg}`);
+
+      if (res.errorCode !== 0) {
+        this.logger.error(`❌ Subscription data error: ${res.errorMsg} (code: ${res.errorCode})`);
+        res.delete();
+        return;
+      }
+
+      // Process StructValues using same approach as fetchByCode
+      const structValues = res.values();
+      if (!structValues || structValues.size() === 0) {
+        this.logger.debug('📡 No StructValues in subscription data');
+        res.delete();
+        return;
+      }
+
+      const records = [];
+      const svObjectCache = {}; // Reusable SVObject cache
+      
+      this.logger.info(`📡 Processing ${structValues.size()} StructValues from subscription data`);
+
+      try {
+        for (let i = 0; i < structValues.size(); i++) {
+          const sv = structValues.get(i);
+          
+          try {
+            // Extract metadata
+            const metaID = sv.metaID;
+            const namespace = sv.namespace;
+            
+            // Find meta information
+            const meta = this.schemaByNamespace[namespace]?.[metaID];
+            if (!meta) {
+              this.logger.debug(`⚠️ Meta not found: ID=${metaID}, namespace=${namespace}`);
+              sv.delete();
+              continue;
+            }
+            
+            const qualifiedName = meta.name;
+            
+            // Create or reuse SVObject instance
+            if (!svObjectCache[qualifiedName]) {
+              svObjectCache[qualifiedName] = new SVObject(this.wasmModule);
+              svObjectCache[qualifiedName].metaName = qualifiedName;
+              svObjectCache[qualifiedName].namespace = namespace;
+              svObjectCache[qualifiedName].revision = 0xFFFFFFFF;
+              svObjectCache[qualifiedName].loadDefFromDict(this.schemaByNamespace);
+            }
+
+            // Reuse existing SVObject instance
+            const svObject = svObjectCache[qualifiedName];
+            svObject.fromSv(sv);
+            const objectData = svObject.toJSON();
+            
+            // Create record
+            const record = {
+              metaName: qualifiedName,
+              namespace: namespace === 0 ? 'global' : 'private',
+              fields: objectData.fields || {},
+              timestamp: Date.now(),
+              receivedAt: new Date().toISOString()
+            };
+            
+            records.push(record);
+            
+          } finally {
+            sv.delete();
+          }
+        }
+        
+        // Cleanup all cached SVObjects
+        for (const metaName in svObjectCache) {
+          svObjectCache[metaName].cleanup();
+        }
+        
+        // Process records through subscription callbacks
+        this.processSubscriptionRecords(records);
+        
+      } catch (processingError) {
+        this.logger.error('Error processing subscription StructValues:', processingError);
+        
+        // Cleanup cached SVObjects on error
+        for (const metaName in svObjectCache) {
+          try {
+            svObjectCache[metaName].cleanup();
+          } catch (cleanupError) {
+            this.logger.error('Error cleaning up SVObject:', cleanupError);
+          }
+        }
+      }
+      
+      res.delete();
+      
+    } catch (error) {
+      this.logger.error('Error handling subscription data:', error);
+    }
+  }
+
+  /**
+   * Process subscription records and call appropriate callbacks
+   */
+  processSubscriptionRecords(records) {
+    if (records.length === 0) {
+      this.logger.debug('📡 No subscription records to process');
+      return;
+    }
+
+    this.logger.info(`📡 Processing ${records.length} subscription records`);
+    let matchedRecords = 0;
+    let verifiedDeliveries = 0;
+
+    for (const record of records) {
+      let recordMatched = false;
+      
+      // Try to match to active subscriptions with verification
+      for (const [subscriptionKey, subscriptionInfo] of this.subscriptions.entries()) {
+        // Subscription verification checklist
+        const checks = {
+          active: subscriptionInfo.active,
+          confirmed: subscriptionInfo.confirmed,
+          hasUUID: !!subscriptionInfo.uuid,
+          validCallback: this.subscriptionCallbacks.has(subscriptionKey)
+        };
+        
+        // Only process for fully verified subscriptions
+        if (!checks.active) {
+          this.logger.debug(`⚠️ Skipping inactive subscription: ${subscriptionKey}`);
+          continue;
+        }
+        
+        if (!checks.confirmed) {
+          this.logger.warn(`⚠️ Skipping unconfirmed subscription: ${subscriptionKey} (UUID: ${subscriptionInfo.uuid})`);
+          continue;
+        }
+        
+        if (!checks.hasUUID) {
+          this.logger.error(`❌ VERIFICATION FAILED: Subscription ${subscriptionKey} has no UUID - data rejected`);
+          continue;
+        }
+        
+        if (!checks.validCallback) {
+          this.logger.error(`❌ VERIFICATION FAILED: No callback found for subscription ${subscriptionKey} (UUID: ${subscriptionInfo.uuid})`);
+          continue;
+        }
+        
+        // Check if this record matches any of the subscribed qualified names
+        const matchesQualifiedName = subscriptionInfo.qualifiedNames.some(qn => 
+          qn === record.metaName || qn === `${record.namespace}::${record.metaName.split('::')[1]}`
+        );
+        
+        if (matchesQualifiedName) {
+          recordMatched = true;
+          
+          this.logger.debug(`✅ Subscription verification passed for ${subscriptionKey}`);
+          this.logger.debug(`   🆔 UUID: ${subscriptionInfo.uuid}`);
+          this.logger.debug(`   📊 Data: ${record.namespace}::${record.metaName}`);
+          this.logger.debug(`   📋 Fields: ${Object.keys(record.fields).length} fields`);
+          
+          // Call the subscription callback
+          const callback = this.subscriptionCallbacks.get(subscriptionKey);
+          try {
+            // Enhance record with subscription UUID for traceability
+            const enhancedRecord = {
+              ...record,
+              subscriptionKey,
+              subscriptionUUID: subscriptionInfo.uuid,
+              market: record.fields.market || record.fields.marketCode || 'unknown',
+              code: record.fields.code || record.fields.symbol || record.fields.stockCode || 'unknown'
+            };
+            
+            callback(enhancedRecord);
+            verifiedDeliveries++;
+            
+            this.logger.debug(`📡 Successfully delivered data to subscription ${subscriptionKey} (UUID: ${subscriptionInfo.uuid})`);
+            
+          } catch (callbackError) {
+            this.logger.error(`❌ Error in subscription callback for ${subscriptionKey} (UUID: ${subscriptionInfo.uuid}): ${callbackError.message}`);
+          }
+          
+          // Emit real-time data event with subscription context
+          this.emit('real_time_data', {
+            ...record,
+            subscriptionKey,
+            subscriptionUUID: subscriptionInfo.uuid
+          });
+        }
+      }
+      
+      if (recordMatched) {
+        matchedRecords++;
+      } else {
+        this.logger.debug(`⚠️ No active subscriptions matched record: ${record.namespace}::${record.metaName}`);
+      }
+    }
+    
+    this.logger.info(`📊 Subscription processing summary:`);
+    this.logger.info(`   📦 Records processed: ${records.length}`);
+    this.logger.info(`   ✅ Records matched: ${matchedRecords}`);
+    this.logger.info(`   📡 Verified deliveries: ${verifiedDeliveries}`);
+    this.logger.info(`   🎯 Active subscriptions: ${Array.from(this.subscriptions.values()).filter(s => s.active).length}`);
+  }
+
+  /**
+   * Handle potential real-time market data messages
+   */
+  handlePotentialRealTimeData(pkg) {
+    if (this.subscriptions.size === 0) {
+      return; // No active subscriptions
+    }
+    
+    // Skip if we can't process the content
+    if (!pkg.content) {
+      return;
+    }
+    
+    this.logger.debug(`📡 Processing potential real-time data message (cmd: ${this.getCommandName(pkg.header.cmd)} (${pkg.header.cmd}))`);
+    
+    // Try to decode as ATSubscribeSVRes for real-time subscription data
+    try {
+      const realTimeRes = new this.wasmModule.ATSubscribeSVRes();
+      realTimeRes.setCompressor(this.compressor);
+      realTimeRes.decode(pkg.content());
+      
+      const structValues = realTimeRes.values();
+      if (!structValues || structValues.size() === 0) {
+        realTimeRes.delete();
+        return;
+      }
+
+      const resultCount = structValues.size();
+      this.logger.debug(`📡 Processing ${resultCount} StructValues from subscription data`);
+
+      // Process each StructValue
+      for (let i = 0; i < resultCount; i++) {
+        const sv = structValues.get(i);
+        
+        try {
+          // Process the StructValue for subscription matching
+          this.processRealTimeDataForSubscription(sv);
+          
+        } finally {
+          sv.delete();
+        }
+      }
+      
+      realTimeRes.delete();
+      
+    } catch (error) {
+      this.logger.debug(`Could not decode as ATSubscribeSVRes: ${error.message}`);
+    }
+  }
+
+  /**
+   * Process real-time data for a specific subscription
+   */
+  processRealTimeDataForSubscription(sv, subscriptionInfo = null, subscriptionKey = null) {
+    // If no subscription info provided, try to match from StructValue
+    if (!subscriptionInfo) {
+      // Extract metadata
+      const metaID = sv.metaID;
+      const namespace = sv.namespace;
+      
+      // Find meta information
+      const meta = this.schemaByNamespace[namespace]?.[metaID];
+      if (!meta) {
+        this.logger.debug(`⚠️ Meta not found: ID=${metaID}, namespace=${namespace}`);
+        return;
+      }
+      
+      const qualifiedName = meta.name;
+      const namespaceStr = namespace === 0 ? 'global' : 'private';
+      
+      // Try to match to an active subscription
+      let matchedSubscription = null;
+      let matchedKey = null;
+      
+      for (const [key, info] of this.subscriptions.entries()) {
+        if (info.active && info.qualifiedName === qualifiedName && info.namespace === namespaceStr) {
+          matchedSubscription = info;
+          matchedKey = key;
+          break;
+        }
+      }
+      
+      if (!matchedSubscription) {
+        this.logger.debug(`📡 No active subscription found for ${qualifiedName} (${namespaceStr})`);
+        return;
+      }
+      
+      subscriptionInfo = matchedSubscription;
+      subscriptionKey = matchedKey;
+    }
+    try {
+      // Create SVObject for processing
+      const svObject = new SVObject(this.wasmModule);
+      svObject.metaName = subscriptionInfo.qualifiedName;
+      svObject.namespace = subscriptionInfo.namespace === 'global' ? 
+        this.wasmModule.NAMESPACE_GLOBAL : this.wasmModule.NAMESPACE_PRIVATE;
+      
+      // Load schema definition
+      svObject.loadDefFromDict(this.schemaByNamespace);
+      
+      // Process the StructValue
+      svObject.fromSv(sv);
+      const objectData = svObject.toJSON();
+      
+      // Create real-time data record
+      const realTimeRecord = {
+        market: svObject.market || subscriptionInfo.market,
+        code: svObject.code || subscriptionInfo.code,
+        timestamp: svObject.timetag ? String(svObject.timetag) : String(Date.now()),
+        metaName: subscriptionInfo.qualifiedName,
+        namespace: subscriptionInfo.namespace,
+        fields: objectData.fields || {},
+        subscriptionKey: subscriptionKey,
+        receivedAt: new Date().toISOString()
+      };
+
+      this.logger.debug(`📡 Real-time data: ${subscriptionInfo.market}/${subscriptionInfo.code} (${subscriptionInfo.qualifiedName})`);
+      
+      // Call the subscription callback
+      const callback = this.subscriptionCallbacks.get(subscriptionKey);
+      if (callback) {
+        try {
+          callback(realTimeRecord);
+        } catch (callbackError) {
+          this.logger.error(`Error in subscription callback for ${subscriptionKey}: ${callbackError.message}`);
+        }
+      }
+      
+      // Emit real-time data event
+      this.emit('real_time_data', realTimeRecord);
+      
+      // Cleanup SVObject
+      svObject.cleanup();
+    } catch (error) {
+      this.logger.error(`Error processing real-time data for subscription ${subscriptionKey}:`, error);
+    }
+  }
+
+  /**
    * Generic fetch by code method - works with any metadata type
    * Returns Promise that resolves with decoded SVObject instances
    */
@@ -832,69 +1423,63 @@ class CaitlynClientConnection {
       this.queryCache.set(currentSeqId, queryInfo);
       this.logger.info(`💾 Cached query parameters for seq=${currentSeqId}`);
       
-      try {
-        // Create ATFetchByCode request
-        const fetchByCodeReq = new this.wasmModule.ATFetchByCodeReq();
-        
-        this.logger.info(`🔍 ATFetchByCodeReq Parameters:`);
-        this.logger.info(`   token: "${this.token}"`);
-        this.logger.info(`   seq: ${currentSeqId}`);
-        this.logger.info(`   namespace: "${namespace}"`);
-        this.logger.info(`   qualifiedName: "${qualifiedName}"`);
-        this.logger.info(`   revision: ${revision}`);
-        this.logger.info(`   market: "${market}"`);
-        this.logger.info(`   code: "${code}"`);
-        this.logger.info(`   granularity: ${granularity}`);
-        this.logger.info(`   fromDate: ${fromDate.toISOString()} (${fromDate.getTime()})`);
-        this.logger.info(`   toDate: ${toDate.toISOString()} (${toDate.getTime()})`);
-        this.logger.info(`   fields: [${fields.map(f => `"${f}"`).join(', ')}] (${fields.length} total)`);
-        
-        fetchByCodeReq.token = this.token;
-        fetchByCodeReq.seq = currentSeqId;
-        fetchByCodeReq.namespace = namespace.toString();  // Convert integer to string for WASM
-        fetchByCodeReq.qualifiedName = qualifiedName;
-        fetchByCodeReq.revision = revision;
-        fetchByCodeReq.market = market;
-        fetchByCodeReq.code = code;
-        fetchByCodeReq.granularity = granularity;
-        
-        // Set fields if provided
-        const fieldsVector = new this.wasmModule.StringVector();
-        if (fields && fields.length > 0) {
-          fields.forEach((field, index) => {
-            this.logger.info(`   Adding field[${index}]: "${field}"`);
-            fieldsVector.push_back(field);
-          });
-        }
-        fetchByCodeReq.fields = fieldsVector;
-        
-        // Set time range - Use Unix timestamps converted to milliseconds as strings
-        const fromTimeTag = fromTime ? (fromTime * 1000).toString() : fromDate.getTime().toString();
-        const toTimeTag = toTime ? (toTime * 1000).toString() : toDate.getTime().toString();
-        this.logger.info(`   fromTimeTag: "${fromTimeTag}" (from Unix ${fromTime})`);
-        this.logger.info(`   toTimeTag: "${toTimeTag}" (from Unix ${toTime})`);
-        
-        fetchByCodeReq.fromTimeTag = fromTimeTag;
-        fetchByCodeReq.toTimeTag = toTimeTag;
-        
-        // Encode and send
-        const pkg = new this.wasmModule.NetPackage();
-        const encodedMsg = pkg.encode(this.wasmModule.CMD_AT_FETCH_BY_CODE, fetchByCodeReq.encode());
-        const msgBuffer = Buffer.from(encodedMsg);
-        
-        this.wsClient.sendBinary(msgBuffer);
-        this.logger.info(`✅ Generic fetch request sent: ${qualifiedName} (seq=${currentSeqId})`);
-        
-        // Cleanup
-        fetchByCodeReq.delete();
-        pkg.delete();
-        fieldsVector.delete();
-        
-      } catch (error) {
-        this.logger.error(`❌ Error sending fetch request: ${error.message}`);
-        this.queryCache.delete(currentSeqId);
-        reject(error);
+      // Create ATFetchByCode request
+      const fetchByCodeReq = new this.wasmModule.ATFetchByCodeReq();
+      
+      this.logger.info(`🔍 ATFetchByCodeReq Parameters:`);
+      this.logger.info(`   token: "${this.token}"`);
+      this.logger.info(`   seq: ${currentSeqId}`);
+      this.logger.info(`   namespace: "${namespace}"`);
+      this.logger.info(`   qualifiedName: "${qualifiedName}"`);
+      this.logger.info(`   revision: ${revision}`);
+      this.logger.info(`   market: "${market}"`);
+      this.logger.info(`   code: "${code}"`);
+      this.logger.info(`   granularity: ${granularity}`);
+      this.logger.info(`   fromDate: ${fromDate.toISOString()} (${fromDate.getTime()})`);
+      this.logger.info(`   toDate: ${toDate.toISOString()} (${toDate.getTime()})`);
+      this.logger.info(`   fields: [${fields.map(f => `"${f}"`).join(', ')}] (${fields.length} total)`);
+      
+      fetchByCodeReq.token = this.token;
+      fetchByCodeReq.seq = currentSeqId;
+      fetchByCodeReq.namespace = namespace.toString();  // Convert integer to string for WASM
+      fetchByCodeReq.qualifiedName = qualifiedName;
+      fetchByCodeReq.revision = revision;
+      fetchByCodeReq.market = market;
+      fetchByCodeReq.code = code;
+      fetchByCodeReq.granularity = granularity;
+      
+      // Set fields if provided
+      const fieldsVector = new this.wasmModule.StringVector();
+      if (fields && fields.length > 0) {
+        fields.forEach((field, index) => {
+          this.logger.info(`   Adding field[${index}]: "${field}"`);
+          fieldsVector.push_back(field);
+        });
       }
+      fetchByCodeReq.fields = fieldsVector;
+      
+      // Set time range - Use Unix timestamps converted to milliseconds as strings
+      const fromTimeTag = fromTime ? (fromTime * 1000).toString() : fromDate.getTime().toString();
+      const toTimeTag = toTime ? (toTime * 1000).toString() : toDate.getTime().toString();
+      this.logger.info(`   fromTimeTag: "${fromTimeTag}" (from Unix ${fromTime})`);
+      this.logger.info(`   toTimeTag: "${toTimeTag}" (from Unix ${toTime})`);
+      
+      fetchByCodeReq.fromTimeTag = fromTimeTag;
+      fetchByCodeReq.toTimeTag = toTimeTag;
+      
+      // Encode and send
+      const pkg = new this.wasmModule.NetPackage();
+      const encodedMsg = pkg.encode(this.wasmModule.CMD_AT_FETCH_BY_CODE, fetchByCodeReq.encode());
+      const msgBuffer = Buffer.from(encodedMsg);
+      
+      this.wsClient.sendBinary(msgBuffer);
+      this.logger.info(`✅ ${this.getCommandName(this.wasmModule.CMD_AT_FETCH_BY_CODE)} sent: ${qualifiedName} (seq=${currentSeqId})`);
+      // Cleanup
+      fetchByCodeReq.delete();
+      pkg.delete();
+      fieldsVector.delete();
+      
+
     });
   }
 
@@ -959,7 +1544,7 @@ class CaitlynClientConnection {
     const msgBuffer = Buffer.from(encodedPkg);
     
     this.wsClient.sendBinary(msgBuffer);
-    this.logger.info(`✅ Generic fetch by time range request sent: metaID=${metaID} (seq=${currentSeqId})`);
+    this.logger.info(`✅ ${this.getCommandName(this.wasmModule.CMD_AT_FETCH_BY_TIME_RANGE)} sent: metaID=${metaID} (seq=${currentSeqId})`);
     
     pkg.delete();
     
@@ -986,6 +1571,103 @@ class CaitlynClientConnection {
     }
     
     return null;
+  }
+
+  /**
+   * Get field names from schema for a qualified name
+   * @param {string} qualifiedName - The qualified name (e.g., 'SampleQuote')
+   * @param {string} schemaKey - The schema key ('0' for global, '1' for private)
+   * @returns {string[]|null} Array of field names or null if not found
+   */
+  getFieldsFromSchema(qualifiedName, schemaKey) {
+    // Look for the metadata in the processed schema (this.schema has the field information)
+    if (this.schema[schemaKey]) {
+      for (const metaId in this.schema[schemaKey]) {
+        const meta = this.schema[schemaKey][metaId];
+        if (meta.name && meta.name.endsWith(`::${qualifiedName}`)) {
+          // Found the metadata, extract field names
+          const fieldNames = [];
+          if (meta.fields && Array.isArray(meta.fields)) {
+            for (const field of meta.fields) {
+              if (field.name && field.name !== 'field_0' && !field.name.startsWith('field_')) {
+                fieldNames.push(field.name);
+              }
+            }
+          }
+          this.logger.debug(`📋 Found ${fieldNames.length} fields in schema for ${qualifiedName} (namespace ${schemaKey}): ${fieldNames.join(', ')}`);
+          return fieldNames;
+        }
+      }
+    }
+    
+    this.logger.debug(`⚠️ No schema fields found for ${qualifiedName} in namespace ${schemaKey}, using defaults`);
+    return null;
+  }
+
+  /**
+   * Get command name from command code for better logging
+   * Complete list of all commands from caitlyn_js.cpp
+   */
+  getCommandName(cmd) {
+    // Complete map of all command codes to names from caitlyn_js.cpp
+    const commandNames = {
+      // NET_CMD constants
+      [this.wasmModule.NET_CMD_GOLD_ROUTE_KEEPALIVE]: 'NET_CMD_GOLD_ROUTE_KEEPALIVE',
+      [this.wasmModule.NET_CMD_GOLD_ROUTE_DATADEF]: 'NET_CMD_GOLD_ROUTE_DATADEF',
+      
+      // CMD_AT constants (client to server)
+      [this.wasmModule.CMD_AT_START_BACKTEST]: 'CMD_AT_START_BACKTEST',
+      [this.wasmModule.CMD_AT_CTRL_BACKTEST]: 'CMD_AT_CTRL_BACKTEST',
+      [this.wasmModule.CMD_AT_UNIVERSE_REV]: 'CMD_AT_UNIVERSE_REV',
+      [this.wasmModule.CMD_AT_UNIVERSE_META]: 'CMD_AT_UNIVERSE_META',
+      [this.wasmModule.CMD_AT_UNIVERSE_SEEDS]: 'CMD_AT_UNIVERSE_SEEDS',
+      [this.wasmModule.CMD_AT_FETCH_BY_CODE]: 'CMD_AT_FETCH_BY_CODE',
+      [this.wasmModule.CMD_AT_FETCH_BY_TIME]: 'CMD_AT_FETCH_BY_TIME',
+      [this.wasmModule.CMD_AT_FETCH_BY_TIME_RANGE]: 'CMD_AT_FETCH_BY_TIME_RANGE',
+      [this.wasmModule.CMD_AT_RUN_FORMULA]: 'CMD_AT_RUN_FORMULA',
+      [this.wasmModule.CMD_AT_REG_FORMULA]: 'CMD_AT_REG_FORMULA',
+      [this.wasmModule.CMD_AT_DEL_FORMULA]: 'CMD_AT_DEL_FORMULA',
+      [this.wasmModule.CMD_AT_CAL_FORMULA]: 'CMD_AT_CAL_FORMULA',
+      [this.wasmModule.CMD_AT_REG_LIBRARIES]: 'CMD_AT_REG_LIBRARIES',
+      [this.wasmModule.CMD_AT_SUBSCRIBE]: 'CMD_AT_SUBSCRIBE',
+      [this.wasmModule.CMD_AT_SUBSCRIBE_SORT]: 'CMD_AT_SUBSCRIBE_SORT',
+      [this.wasmModule.CMD_AT_UNSUBSCRIBE]: 'CMD_AT_UNSUBSCRIBE',
+      [this.wasmModule.CMD_AT_ACCOUNT_ADD]: 'CMD_AT_ACCOUNT_ADD',
+      [this.wasmModule.CMD_AT_ACCOUNT_DEL]: 'CMD_AT_ACCOUNT_DEL',
+      [this.wasmModule.CMD_AT_ACCOUNT_EDIT]: 'CMD_AT_ACCOUNT_EDIT',
+      [this.wasmModule.CMD_AT_MODIFY_BASKET]: 'CMD_AT_MODIFY_BASKET',
+      [this.wasmModule.CMD_AT_MANUAL_TRADE]: 'CMD_AT_MANUAL_TRADE',
+      [this.wasmModule.CMD_AT_MANUAL_EDIT]: 'CMD_AT_MANUAL_EDIT',
+      [this.wasmModule.CMD_AT_ADD_STRATEGY_INSTANCE]: 'CMD_AT_ADD_STRATEGY_INSTANCE',
+      [this.wasmModule.CMD_AT_DEL_STRATEGY_INSTANCE]: 'CMD_AT_DEL_STRATEGY_INSTANCE',
+      [this.wasmModule.CMD_AT_EDIT_STRATEGY_INSTANCE]: 'CMD_AT_EDIT_STRATEGY_INSTANCE',
+      [this.wasmModule.CMD_AT_QUERY_STRATEGY_INSTANCE]: 'CMD_AT_QUERY_STRATEGY_INSTANCE',
+      [this.wasmModule.CMD_AT_QUERY_STRATEGY_INSTANCE_LOG]: 'CMD_AT_QUERY_STRATEGY_INSTANCE_LOG',
+      [this.wasmModule.CMD_AT_SHARE_BACKTEST]: 'CMD_AT_SHARE_BACKTEST',
+      [this.wasmModule.CMD_AT_QUERY_ORDERS]: 'CMD_AT_QUERY_ORDERS',
+      [this.wasmModule.CMD_AT_DEBUG_LIVE]: 'CMD_AT_DEBUG_LIVE',
+      [this.wasmModule.CMD_AT_DEBUG_COVERUP]: 'CMD_AT_DEBUG_COVERUP',
+      [this.wasmModule.CMD_AT_DEBUG_ADD_ACCOUNT]: 'CMD_AT_DEBUG_ADD_ACCOUNT',
+      [this.wasmModule.CMD_AT_HANDSHAKE]: 'CMD_AT_HANDSHAKE',
+      [this.wasmModule.CMD_AT_ACCOUNT_CHANGE_CAPITAL]: 'CMD_AT_ACCOUNT_CHANGE_CAPITAL',
+      [this.wasmModule.CMD_AT_QUERY_BACK_TEST_PROCS]: 'CMD_AT_QUERY_BACK_TEST_PROCS',
+      [this.wasmModule.CMD_AT_QUERY_BACK_TEST_PROC_LOG]: 'CMD_AT_QUERY_BACK_TEST_PROC_LOG',
+      [this.wasmModule.CMD_AT_QUERY_BACK_TEST_PROC_CONTROL]: 'CMD_AT_QUERY_BACK_TEST_PROC_CONTROL',
+      [this.wasmModule.CMD_AT_ADD_LIMITS]: 'CMD_AT_ADD_LIMITS',
+      [this.wasmModule.CMD_AT_DEL_LIMITS]: 'CMD_AT_DEL_LIMITS',
+      [this.wasmModule.CMD_AT_SKIP_BREACH]: 'CMD_AT_SKIP_BREACH',
+      
+      // CMD_TA constants (server to client)
+      [this.wasmModule.CMD_TA_MARKET_STATUS]: 'CMD_TA_MARKET_STATUS',
+      [this.wasmModule.CMD_TA_PUSH_DATA]: 'CMD_TA_PUSH_DATA',
+      [this.wasmModule.CMD_TA_SUBSCRIBE_HEADER]: 'CMD_TA_SUBSCRIBE_HEADER',
+      [this.wasmModule.CMD_TA_PUSH_PROGRESS]: 'CMD_TA_PUSH_PROGRESS',
+      [this.wasmModule.CMD_TA_PUSH_LOG]: 'CMD_TA_PUSH_LOG',
+      [this.wasmModule.CMD_TA_MARKET_SINGULARITY]: 'CMD_TA_MARKET_SINGULARITY',
+      [this.wasmModule.CMD_TA_PUSH_FORMULA]: 'CMD_TA_PUSH_FORMULA'
+    };
+
+    return commandNames[cmd] || `UNKNOWN_CMD_${cmd}`;
   }
 
   /**
@@ -1049,6 +1731,11 @@ class CaitlynClientConnection {
     this.isDisconnecting = true;
     this.logger.debug('🔌 Starting disconnect process...');
     
+    // Shutdown subscription hub BEFORE closing WebSocket connection
+    // This allows unsubscribe messages to be sent properly
+    this.shutdownHub();
+    
+    // Now close the WebSocket connection
     if (this.wsClient) {
       this.wsClient.close();
       this.wsClient = null;
@@ -1066,6 +1753,245 @@ class CaitlynClientConnection {
   }
 
   /**
+   * Subscribe to real-time data updates using ATSubscribeReq WASM command
+   * @param {string|string[]} markets - Market code(s) (e.g., 'ICE' or ['ICE', 'DCE'])
+   * @param {string|string[]} codes - Security code(s) (e.g., 'B<00>' or ['B<00>', 'i<00>'])
+   * @param {string|string[]} qualifiedNames - Metadata type(s) (e.g., 'SampleQuote' or ['SampleQuote', 'Market'])
+   * @param {string} namespace - Namespace ('global' or 'private')
+   * @param {Function} callback - Function to call with real-time data updates
+   * @param {Object} options - Additional subscription options
+   * @returns {string} subscription key for unsubscribing
+   */
+  subscribe(markets, codes, qualifiedNames, namespace = 'global', callback, options = {}) {
+    if (!this.isInitialized) {
+      throw new Error('Connection must be initialized before subscribing');
+    }
+    
+    if (typeof callback !== 'function') {
+      throw new Error('Callback must be a function');
+    }
+    
+    // Validate namespace parameter
+    if (!['global', 'private'].includes(namespace)) {
+      throw new Error(`Invalid namespace: ${namespace}. Must be 'global' or 'private'`);
+    }
+    
+    // Normalize inputs to arrays
+    const marketList = Array.isArray(markets) ? markets : [markets];
+    const codeList = Array.isArray(codes) ? codes : [codes];
+    const qualifiedNameList = Array.isArray(qualifiedNames) ? qualifiedNames : [qualifiedNames];
+    
+    // Validate inputs
+    if (marketList.length === 0 || codeList.length === 0 || qualifiedNameList.length === 0) {
+      throw new Error('Markets, codes, and qualifiedNames cannot be empty');
+    }
+    
+    // Convert namespace formats once at the beginning for consistent usage
+    const schemaKey = namespace === 'global' ? '0' : '1';
+    
+    // Generate unique subscription UUID
+    const subscriptionUUID = this.generateSubscriptionUUID();
+    const subscriptionKey = `${marketList.join(',')}/${codeList.join(',')}/${qualifiedNameList.join(',')}/${namespace}`;
+    
+    // Create ATSubscribeReq using WASM - no constructor parameters
+    const currentSeq = this.getNextSeq();
+    const subscribeReq = new this.wasmModule.ATSubscribeReq();
+    
+    // Set basic properties (refer to caitlyn_js.cpp for exact property names)
+    subscribeReq.token = this.token;
+    subscribeReq.seq = currentSeq;
+    subscribeReq.UUID = subscriptionUUID;
+    
+    // Create vectors for markets
+    const marketsVector = new this.wasmModule.StringVector();
+    marketList.forEach(market => marketsVector.push_back(market));
+    
+    // Create vectors for symbols
+    const symbolsVector = new this.wasmModule.StringVector();
+    codeList.forEach(code => symbolsVector.push_back(code));
+    
+    // Create vectors for qualified names (with namespace prefix)
+    const qualifiedNamesVector = new this.wasmModule.StringVector();
+    qualifiedNameList.forEach(qualifiedName => {
+      const fullQualifiedName = `${namespace}::${qualifiedName}`;
+      qualifiedNamesVector.push_back(fullQualifiedName);
+    });
+    
+    // Set arrays using proper WASM methods (refer to caitlyn_js.cpp for exact field names)
+    subscribeReq.markets = marketsVector;
+    subscribeReq.symbols = symbolsVector;
+    subscribeReq.qualifiedNames = qualifiedNamesVector;  // JavaScript property name: "qualifiedNames"
+    
+    // Set granularities (required)
+    const granularities = options.granularities;
+    if (!granularities || !Array.isArray(granularities) || granularities.length === 0) {
+      throw new Error('Granularities must be provided as a non-empty array');
+    }
+    const granularitiesVector = new this.wasmModule.Uint32Vector();
+    granularities.forEach(g => granularitiesVector.push_back(g));
+    subscribeReq.granularities = granularitiesVector;
+    
+    // Set fields using StringMatrix (vector<vector<string>>)
+    const fieldsMatrix = new this.wasmModule.StringMatrix();
+    
+    // Each qualified name must have its corresponding field set
+    // The server requires: qualified_names.size() == fields.size()
+    for (let i = 0; i < qualifiedNameList.length; i++) {
+      const qualifiedName = qualifiedNameList[i];
+      const fieldsRow = new this.wasmModule.StringVector();
+      
+      if (options.fields && Array.isArray(options.fields)) {
+        if (Array.isArray(options.fields[i])) {
+          // Use specific fields for this qualified name index
+          options.fields[i].forEach(field => fieldsRow.push_back(field));
+        } else if (typeof options.fields[0] === 'string' && qualifiedNameList.length === 1) {
+          // Single qualified name with flat array of fields
+          options.fields.forEach(field => fieldsRow.push_back(field));
+        } else {
+          throw new Error(`Fields array must contain ${qualifiedNameList.length} field arrays, one for each qualified name`);
+        }
+      } else {
+        // Look up fields from schema for this qualified name
+        const schemaFields = this.getFieldsFromSchema(qualifiedName, schemaKey);
+        
+        if (!schemaFields || schemaFields.length === 0) {
+          throw new Error(`No fields found in schema for ${qualifiedName} in namespace ${namespace}. Please provide fields explicitly.`);
+        }
+        
+        schemaFields.forEach(field => fieldsRow.push_back(field));
+      }
+      
+      fieldsMatrix.push_back(fieldsRow);
+      fieldsRow.delete();
+    }
+    
+    subscribeReq.fields = fieldsMatrix;
+    
+    // Debug: Check sizes match server requirement
+    this.logger.debug(`🔍 Debug: qualified_names.size()=${qualifiedNamesVector.size()}, fields.size()=${fieldsMatrix.size()}`);
+    
+    // Set optional parameters
+    if (options.start !== undefined) {
+      subscribeReq.start = options.start;
+    }
+    if (options.end !== undefined) {
+      subscribeReq.end = options.end;
+    }
+    if (options.sort && Array.isArray(options.sort)) {
+      const sortVector = new this.wasmModule.StringVector();
+      options.sort.forEach(s => sortVector.push_back(s));
+      subscribeReq.sort = sortVector;
+      sortVector.delete();
+    }
+    if (options.direction && Array.isArray(options.direction)) {
+      const directionVector = new this.wasmModule.Uint8Vector();
+      options.direction.forEach(d => directionVector.push_back(d));
+      subscribeReq.direction = directionVector;
+      directionVector.delete();
+    }
+    
+    // Store subscription info
+    const subscriptionInfo = {
+      uuid: subscriptionUUID,
+      markets: marketList,
+      codes: codeList,
+      qualifiedNames: qualifiedNameList.map(qn => `${namespace}::${qn}`),
+      namespace,
+      subscribedAt: new Date(),
+      active: true,
+      seq: currentSeq,
+      granularities: granularities,
+      options: { ...options }
+    };
+    
+    this.subscriptions.set(subscriptionKey, subscriptionInfo);
+    this.subscriptionCallbacks.set(subscriptionKey, callback);
+    
+    // Create NetPackage and send
+    const pkg = new this.wasmModule.NetPackage();
+    const msgBuffer = Buffer.from(pkg.encode(this.wasmModule.CMD_AT_SUBSCRIBE, subscribeReq.encode()));
+
+    this.wsClient.sendBinary(msgBuffer);
+    
+    this.logger.info(`📡 Sent ${this.getCommandName(this.wasmModule.CMD_AT_SUBSCRIBE)} for: ${subscriptionKey}`);
+    this.logger.info(`   🆔 UUID: ${subscriptionUUID}`);
+    this.logger.info(`   📊 Markets: [${marketList.join(', ')}], Codes: [${codeList.join(', ')}]`);
+    this.logger.info(`   🧬 Qualified Names (${qualifiedNameList.length}): [${qualifiedNameList.map(qn => `${namespace}::${qn}`).join(', ')}]`);
+    this.logger.info(`   🏷️ Fields Matrix (${fieldsMatrix.size()} rows): One field set per qualified name`);
+    this.logger.info(`   ⏱️ Granularities: [${granularities.join(', ')}] seconds`);
+    
+    // Cleanup WASM objects
+    marketsVector.delete();
+    symbolsVector.delete();
+    qualifiedNamesVector.delete();
+    granularitiesVector.delete();
+    fieldsMatrix.delete();
+    subscribeReq.delete();
+    pkg.delete();
+    
+    return subscriptionKey;
+  }
+  
+  /**
+   * Unsubscribe from real-time data using ATUnsubscribeReq WASM command
+   * @param {string} subscriptionKey - Key returned from subscribe()
+   */
+  unsubscribe(subscriptionKey) {
+    if (!this.subscriptions.has(subscriptionKey)) {
+      this.logger.warn(`⚠️ Subscription not found: ${subscriptionKey}`);
+      return false;
+    }
+    
+    const subscription = this.subscriptions.get(subscriptionKey);
+    
+    // Create ATUnsubscribeReq using WASM - no constructor parameters
+    const currentSeq = this.getNextSeq();
+    const unsubscribeReq = new this.wasmModule.ATUnsubscribeReq();
+    
+    // Set basic properties
+    unsubscribeReq.token = this.token;
+    unsubscribeReq.seq = currentSeq;
+    unsubscribeReq.uuid = subscription.uuid;
+    
+    // Create NetPackage and send
+    const pkg = new this.wasmModule.NetPackage();
+    const msgBuffer = Buffer.from(pkg.encode(this.wasmModule.CMD_AT_UNSUBSCRIBE, unsubscribeReq.encode()));
+    
+    // Check if WebSocket is still available before sending
+    if (this.wsClient && this.isConnected) {
+      this.wsClient.sendBinary(msgBuffer);
+      this.logger.info(`📡 Sending ${this.getCommandName(this.wasmModule.CMD_AT_UNSUBSCRIBE)} for: ${subscriptionKey}`);
+      this.logger.info(`   🆔 UUID: ${subscription.uuid}`);
+    } else {
+      this.logger.warn(`⚠️ Cannot send unsubscribe - WebSocket is disconnected for: ${subscriptionKey}`);
+    }
+    
+    // Mark as inactive and clean up
+    subscription.active = false;
+    this.subscriptions.delete(subscriptionKey);
+    this.subscriptionCallbacks.delete(subscriptionKey);
+    
+    // Cleanup WASM objects
+    unsubscribeReq.delete();
+    pkg.delete();
+    
+    return true;
+  }
+  
+  /**
+   * Get all active subscriptions
+   */
+  getActiveSubscriptions() {
+    const activeSubscriptions = {};
+    for (const [key, info] of this.subscriptions.entries()) {
+      if (info.active) {
+        activeSubscriptions[key] = info;
+      }
+    }
+    return activeSubscriptions;
+  }
+
+  /**
    * Get connection status
    */
   getStatus() {
@@ -1075,8 +2001,90 @@ class CaitlynClientConnection {
       url: this.url,
       marketsCount: Object.keys(this.marketsData.global || {}).length,
       securitiesCount: Object.values(this.securitiesByMarket).reduce((sum, arr) => sum + arr.length, 0),
-      schemaObjects: Object.keys(this.schema).reduce((sum, ns) => sum + Object.keys(this.schema[ns]).length, 0)
+      schemaObjects: Object.keys(this.schema).reduce((sum, ns) => sum + Object.keys(this.schema[ns]).length, 0),
+      activeSubscriptions: this.subscriptions.size
     };
+  }
+
+  /**
+   * Generate unique subscription UUID
+   */
+  generateSubscriptionUUID() {
+    return 'sub-' + Date.now() + '-' + Math.random().toString(36).substring(2, 11);
+  }
+
+  /**
+   * Get next sequence ID for requests
+   */
+  getNextSeq() {
+    return ++this.sequenceId;
+  }
+
+  // ===== SUBSCRIPTION HUB METHODS =====
+  
+  /**
+   * Subscribe using the hub (recommended for production)
+   * Provides automatic deduplication and broadcast capabilities
+   * @param {string|string[]} markets - Market codes
+   * @param {string|string[]} codes - Security codes
+   * @param {string|string[]} qualifiedNames - Metadata types
+   * @param {string} namespace - 'global' or 'private'
+   * @param {Function} callback - Data callback function
+   * @param {Object} options - Subscription options
+   * @returns {string} subscriber ID for unsubscribing
+   */
+  subscribeHub(markets, codes, qualifiedNames, namespace = 'global', callback, options = {}) {
+    if (!this.subscriptionHub) {
+      throw new Error('Subscription hub is not enabled. Set useSubscriptionHub: true in constructor options.');
+    }
+    
+    return this.subscriptionHub.subscribe(markets, codes, qualifiedNames, namespace, callback, options);
+  }
+
+  /**
+   * Unsubscribe using the hub
+   * @param {string} subscriberId - ID returned from subscribeHub()
+   * @returns {boolean} true if successfully unsubscribed
+   */
+  unsubscribeHub(subscriberId) {
+    if (!this.subscriptionHub) {
+      throw new Error('Subscription hub is not enabled.');
+    }
+    
+    return this.subscriptionHub.unsubscribe(subscriberId);
+  }
+
+  /**
+   * Get subscription hub statistics
+   * @returns {Object} subscription statistics
+   */
+  getHubStats() {
+    if (!this.subscriptionHub) {
+      return { error: 'Subscription hub is not enabled' };
+    }
+    
+    return this.subscriptionHub.getStats();
+  }
+
+  /**
+   * Cleanup orphaned subscriptions in the hub
+   * @returns {number} number of subscriptions cleaned up
+   */
+  cleanupHubSubscriptions() {
+    if (!this.subscriptionHub) {
+      return 0;
+    }
+    
+    return this.subscriptionHub.cleanup();
+  }
+
+  /**
+   * Shutdown the subscription hub
+   */
+  shutdownHub() {
+    if (this.subscriptionHub) {
+      this.subscriptionHub.shutdown();
+    }
   }
 }
 
